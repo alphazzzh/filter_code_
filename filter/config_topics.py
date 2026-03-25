@@ -99,6 +99,21 @@ class SyntaxRuleConfig:
     params:       dict[str, Any]    = field(default_factory=dict)
     evidence_key: str | None        = None  # 存放证据列表的键名，None=不保存证据
 
+from typing import Callable, Any  # 确保顶部有导入
+
+@dataclass
+class OODFallbackRule:
+    """
+    全局物理废料兜底规则 (OOD Fallback)
+    专门拦截大模型雷达未能覆盖的“未知领域废话”
+    """
+    rule_id: str
+    delta: int
+    tag: str
+    reason: str
+    # condition 接收一个扁平化的运行时上下文(字典)，返回布尔值决定是否触发
+    condition: Callable[[dict[str, Any]], bool]
+
 
 @dataclass
 class MatrixCombination:
@@ -164,6 +179,41 @@ class TopicDefinition:
     syntax_rules: list[SyntaxRuleConfig]    = field(default_factory=list)
     scoring_rules: ScoringRules             = field(default_factory=ScoringRules)
 
+
+
+# ─────────────────────────────────────────────────────────────
+# 全局物理兜底规则注册表
+# ─────────────────────────────────────────────────────────────
+OOD_FALLBACK_REGISTRY: list[OODFallbackRule] = [
+    OODFallbackRule(
+        rule_id="entity_sparsity",
+        delta=-15,
+        tag="global_business_sparse",
+        reason="未命中任何高危主题，且全局业务实体极度稀疏，判定为无实质内容",
+        # 依赖 NLP 硬句法探针的特征
+        condition=lambda ctx: ctx.get("is_business_sparse", False)
+    ),
+    OODFallbackRule(
+        rule_id="too_short_interaction",
+        delta=-20,
+        tag="global_too_short",
+        reason="未命中高危主题，且有效交互轮次过少，判定为碎片废料",
+        # 依赖拓扑引擎计算的有效交互轮次
+        condition=lambda ctx: ctx.get("valid_turn_count", 0) <= 3
+    ),
+    OODFallbackRule(
+        rule_id="monologue_noise",
+        delta=-15,
+        tag="global_monologue_noise",
+        reason="无效沟通：单方面输出且无实质性互动响应（如推销失败/自言自语）",
+        # 依赖多维度的博弈互动指标综合判断
+        condition=lambda ctx: (
+            ctx.get("valid_turn_count", 0) > 3 and
+            ctx.get("compliance_rate", 1.0) == 0.0 and
+            ctx.get("ping_pong_rate", 1.0) < 0.1
+        )
+    )
+]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 主题配置定义
@@ -2008,6 +2058,7 @@ _TOPIC_GLOBAL_SYNTAX_REGISTRY = TopicDefinition(
     ],
     scoring_rules = ScoringRules(standalone_score=0)
 )
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

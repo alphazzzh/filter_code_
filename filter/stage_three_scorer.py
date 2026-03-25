@@ -33,6 +33,7 @@ from config_topics import (
     TopicCategory,
     TopicDefinition,
     get_topics_by_category,
+    OOD_FALLBACK_REGISTRY,
 )
 
 
@@ -211,10 +212,14 @@ class IntelligenceScorer:
         # ── 2. 全局受害者抵抗降权 (Task 3) ──
         self._run_target_resistance_discount(ctx, stage2_result, high_risk_hit_count > 0)
 
-        # ── 3. LOW_VALUE_NOISE：降权扣分 (Task 1) ──
-        # 🚨 核心逻辑：高危意图绝对优先。如果命中了风险主题，则跳过所有噪声扣分。
+        # ── 3. LOW_VALUE_NOISE & OOD 物理兜底 ──
+        # 🚨 核心逻辑：高危意图绝对优先。未命中风险时，才进行废料降权。
         if high_risk_hit_count == 0:
+            # 3.1 语义层降权（已知类别的废话：外卖/闲聊/打错电话）
             self._run_noise_topics(ctx, all_intents, nlp_feats)
+            
+            # 3.2 物理层兜底（OOD 未知领域的废话：基于拓扑结构和实体密度）
+            self._run_ood_fallback(ctx, stage2_result, nlp_feats)
 
         # ── 4. WHITELIST：超级白名单 & 机器人豁免 (Task 2) ──
         # 无视任何高危标签，强制执行扣分
@@ -565,3 +570,33 @@ class IntelligenceScorer:
                 for e in ctx.events
             ],
         }
+    
+    def _run_ood_fallback(
+        self, 
+        ctx: _ScoringContext, 
+        stage2_result: StageTwoResult, 
+        nlp_feats: dict[str, Any]
+    ) -> None:
+        """
+        OOD 物理废料兜底执行器。
+        构建当前的运行时动态快照，并遍历执行 config_topics 中定义的规则。
+        """
+        ifeats = stage2_result.interaction_features
+        valid_turns = sum(1 for t in stage2_result.dialogue_turns if not t.is_backchannel)
+        
+        # 构建统一的上下文快照 (Runtime Evaluation Context)
+        eval_context: dict[str, Any] = {
+            "valid_turn_count": valid_turns,
+            "compliance_rate":  ifeats.compliance_rate,
+            "ping_pong_rate":   ifeats.negotiation_ping_pong_rate,
+            **nlp_feats  # 将所有的 NLP 布尔特征混入上下文
+        }
+
+        # 遍历配置驱动的物理兜底规则
+        for rule in OOD_FALLBACK_REGISTRY:
+            if rule.condition(eval_context):
+                ctx.apply(
+                    delta  = rule.delta, 
+                    tag    = rule.tag, 
+                    reason = rule.reason
+                )
