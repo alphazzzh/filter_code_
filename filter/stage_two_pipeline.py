@@ -532,26 +532,42 @@ class StageTwoPipeline:
             speaker_nlp_feats[sid] = self._syntax.extract(speaker_text).to_dict() if speaker_text.strip() else NlpFeatures(nlp_backend=self._syntax._backend.name).to_dict()
 
         
-        # ── 2. 动态搜索轨道（鲁棒整合） ──
+        # ── 2. 动态搜索轨道（鲁棒整合 + 滑动窗口切块） ──
         dynamic_search_result = None
 
-    # 鲁棒性设计 1：安全的字典读取
+        # 鲁棒性设计 1：安全的字典读取
         dynamic_topic = extra_metadata.get("dynamic_topic") if extra_metadata else None
         
         if dynamic_topic and isinstance(dynamic_topic, str):
-            # 鲁棒性设计 2：清洗对话文本。
-            # 绝对不要把 "嗯", "啊" (is_backchannel) 传给大模型，这会严重干扰语义相似度
-            valid_turn_texts = [
-                t.merged_text.strip() 
-                for t in labeled_turns 
+            # 清洗对话文本，剔除无意义的语气词 "嗯", "啊"
+            valid_turns = [
+                t for t in labeled_turns 
                 if not t.is_backchannel and len(t.merged_text.strip()) > 1
             ]
             
-            if valid_turn_texts:
-                # 调用雷达进行搜索
+            if valid_turns:
+                # =========================================================
+                # 【RAG 优化方向二：滑动窗口上下文重组 (Contextual Chunking)】
+                # 设定窗口大小为 5 句话，步长为 2 句话，保留上下文交叉
+                # =========================================================
+                window_size = 5
+                stride = 2
+                search_chunks = []
+                
+                for i in range(0, len(valid_turns), stride):
+                    window = valid_turns[i : i + window_size]
+                    if not window:
+                        break
+                    # 拼接带说话人标识的完整上下文，例如： "[0] 喂你好 [1] 你的快递到了"
+                    chunk_text = " ".join([f"[{t.speaker_id}] {t.merged_text.strip()}" for t in window])
+                    search_chunks.append(chunk_text)
+
+                # 调用雷达进行搜索，传入拼接好的上下文块
                 dynamic_search_result = self._radar.dynamic_search(
-                    turn_texts=valid_turn_texts, 
-                    dynamic_topic=dynamic_topic
+                    search_chunks=search_chunks, 
+                    dynamic_topic=dynamic_topic,
+                    default_threshold=0.65,
+                    top_k=10  # 请求返回前 10 个高分片段
                 )
             else:
                 # 对话全是废话/静音，直接返回未匹配
@@ -559,6 +575,7 @@ class StageTwoPipeline:
                     "topic_queried": dynamic_topic,
                     "matched": False,
                     "max_score": 0.0,
+                    "top_matches": [],
                     "status": "skipped_due_to_pure_backchannel"
                 }
 

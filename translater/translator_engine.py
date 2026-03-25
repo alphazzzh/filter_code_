@@ -32,25 +32,25 @@ class LLMTranslatorService:
         return json.dumps(payload, ensure_ascii=False)
 
     def call_llm(self, user_prompt: str) -> str:
+        from openai import OpenAI
+        import os
+
+        # 1. 将客户端指向本地启动的服务地址
+        client = OpenAI(
+            base_url="http://localhost:8000/v1",  # 👉 替换为你本地服务的真实 IP 和 端口
+            api_key="EMPTY"                       # 👉 本地服务通常不需要 Key，随便填一个占位符即可，防止库报错
+        )
+        
+        response = client.chat.completions.create(
+            model="你的本地模型名称",               # 👉 替换为你本地加载的模型名，例如 "Qwen1.5-14B-Chat", "llama3"
+            messages=[
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+        return response.choices[0].message.content
         """
-        [此处为 LLM SDK 接入点]
-        实际开发时，将这里的存根代码替换为 OpenAI / Claude / 通义千问 等大模型的真实调用代码。
-
-        接入示例（二选一，取消注释即可）：
-        -------------------------------------------------------
-        # ① OpenAI / Azure OpenAI
-        # from openai import OpenAI
-        # client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        # response = client.chat.completions.create(
-        #     model="gpt-4o",
-        #     messages=[
-        #         {"role": "system", "content": self.SYSTEM_PROMPT},
-        #         {"role": "user",   "content": user_prompt},
-        #     ],
-        #     temperature=0.2,
-        # )
-        # return response.choices[0].message.content
-
         # ② Anthropic Claude
         # import anthropic
         # client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])

@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import threading
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Any
 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -217,63 +217,80 @@ class IntentRadar:
 
         return all_scores
     
-    # 新增语义检索
+
+    # 新增语义检索 (支持 Top-10 滑动窗口完整召回)
     def dynamic_search(
         self, 
-        turn_texts: list[str], 
+        search_chunks: list[str], 
         dynamic_topic: str, 
-        default_threshold: float = 0.65
+        default_threshold: float = 0.65,
+        top_k: int = 10
     ) -> dict[str, Any]:
         """
-        零样本动态语义检索
+        零样本动态语义检索（RAG 增强版）
         """
-        # 鲁棒性设计 1：空值与边界拦截
         clean_topic = dynamic_topic.strip() if dynamic_topic else ""
-        if not turn_texts or not clean_topic:
+        if not search_chunks or not clean_topic:
             return {
                 "topic_queried": clean_topic,
                 "matched": False, 
                 "max_score": 0.0,
+                "top_matches": [],
                 "status": "skipped_due_to_empty_input"
             }
 
         try:
-            # 鲁棒性设计 2：BGE-M3 检索专属 Prompt 构造
-            # 对于 BGE 模型，Query 必须加 instruction 才能在非对称检索中获得高准确率
+            # 1. 构造检索向量
             query_instruction = f"为这个句子生成表示以用于检索相关文章：{clean_topic}"
+            query_vec = self._model.encode([query_instruction])[0]
             
-            # 执行编码
-            query_vec = self._model.encode([query_instruction])[0]  # Shape: (dim,)
-            doc_vecs = self._model.encode(turn_texts)               # Shape: (N, dim)
+            # 2. 对所有滑动窗口块进行向量化
+            doc_vecs = self._model.encode(search_chunks)
 
-            # 鲁棒性设计 3：安全矩阵运算 (处理单条/多条文本的维度对齐)
-            # 确保向量是 numpy array 且处理可能出现的一维情况
             if doc_vecs.ndim == 1:
                 doc_vecs = doc_vecs.reshape(1, -1)
                 
-            # 计算余弦相似度 (BGE encode 默认已 L2 归一化，直接点乘即可)
+            # 3. 计算余弦相似度矩阵
             similarities = np.dot(doc_vecs, query_vec)
 
-            # 提取最高分及对应文本片段（用于审计防查）
-            best_idx = int(np.argmax(similarities))
-            max_score = float(similarities[best_idx])
-            best_snippet = turn_texts[best_idx][:50] + "..." # 仅截取前50字防日志过大
+            # =========================================================
+            # 【RAG 优化方向三：召回阈值以上的 Top-K 完整对话】
+            # =========================================================
+            # 找出所有大于等于安全阈值的索引
+            valid_indices = np.where(similarities >= default_threshold)[0]
+            
+            top_matches = []
+            if len(valid_indices) > 0:
+                # 按相似度从高到低排序
+                sorted_valid_indices = valid_indices[np.argsort(similarities[valid_indices])[::-1]]
+                # 截取前 K 个
+                top_indices = sorted_valid_indices[:top_k]
+                
+                # 组装返回结果，直接返回带说话人的完整上下文
+                for idx in top_indices:
+                    top_matches.append({
+                        "score": round(float(similarities[idx]), 4),
+                        "chunk_text": search_chunks[idx]  # 直接返回完整的原汁原味的对话块
+                    })
+
+            # 计算全局最高分
+            max_score = float(np.max(similarities)) if len(similarities) > 0 else 0.0
 
             return {
                 "topic_queried": clean_topic,
-                "matched": max_score >= default_threshold,
+                "matched": len(top_matches) > 0,
                 "max_score": round(max_score, 4),
-                "best_match_snippet": best_snippet if max_score >= default_threshold else None,
+                "top_matches": top_matches,
                 "status": "success"
             }
 
         except Exception as e:
-            # 鲁棒性设计 4：异常隔离。大模型计算失败绝不能抛出异常导致外层 HTTP 500
             logger.error(f"[DynamicSearch] 检索主题 '{clean_topic}' 时发生异常: {str(e)}", exc_info=True)
             return {
                 "topic_queried": clean_topic,
                 "matched": False,
                 "max_score": 0.0,
+                "top_matches": [],
                 "status": "error",
                 "error_msg": str(e)
             }
