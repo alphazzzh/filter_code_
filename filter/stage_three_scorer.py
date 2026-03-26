@@ -34,7 +34,9 @@ from config_topics import (
     TopicDefinition,
     get_topics_by_category,
     OOD_FALLBACK_REGISTRY,
+    PROFANITY_REGISTRY,
 )
+from models import BotLabel
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -263,7 +265,7 @@ class IntelligenceScorer:
 
             # Step B：矩阵组合扫描（优先级高于单项分）
             for combo in topic_def.scoring_rules.matrix_combinations:
-                hard_feat_value = bool(nlp_feats.get(combo.syntax_feature, False))
+                hard_feat_value = bool(agent_nlp_feats.get(combo.syntax_feature, False))
                 
                 # 👇 新增：识别正向/负向触发逻辑
                 triggered = False
@@ -600,3 +602,300 @@ class IntelligenceScorer:
                     tag    = rule.tag, 
                     reason = rule.reason
                 )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BotConfidenceEngine —— 多维置信度机器人检测引擎
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Voicemail 正则词库（用于 AdvancedVoicemailDetector）
+_VOICEMAIL_REGEX_WORDS: list[str] = [
+    "无法接通", "暂时无法接通", "正在通话中", "电话正忙",
+    "不在服务区", "已启用来电提醒", "无人接听", "呼叫超时",
+    "已挂断", "请在提示音后留言", "录音完成后挂断",
+    "留言最长", "按井号键", "语音信箱已满", "呼叫转移",
+    "转接语音信箱", "正在为您转接", "号码是空号",
+    "已停机", "已过期", "请勿挂机", "余额不足",
+    "通话已被录音", "会议通话中", "等待音乐",
+    "The number you dialed", "leave a message", "mailbox is full",
+    "call is being transferred", "line is busy",
+]
+
+
+class BotConfidenceEngine:
+    """
+    多维置信度机器人检测引擎。
+
+    评分规则（基础分 0，叠加计分）：
+      - 命中 csr_bot_whitelist 软意图         → +40
+      - filler_word_rate < 0.005（极度流畅）   → +30
+      - ping_pong_rate 极度规律且无并发        → +30
+
+    一票否决（得分归零，强制标记为 HUMAN）：
+      - 触发 PROFANITY_REGISTRY（脏话/攻击性词汇）
+      - 复杂的反问逻辑（受害者主动反问 + 识破意图）
+
+    最终得分 > 80 判定为 BOT。
+    """
+
+    # ── 评分阈值 ──────────────────────────────────────────
+    _BOT_THRESHOLD: int = 80
+
+    # ── 加分权重 ──────────────────────────────────────────
+    _SCORE_CSR_WHITELIST:  int = 40
+    _SCORE_FLUENCY:        int = 30
+    _FLUENCY_THRESHOLD:    float = 0.005
+    _SCORE_PING_PONG:      int = 30
+
+    def evaluate(
+        self,
+        stage2_result: StageTwoResult,
+        filler_word_rate: float = 0.0,
+    ) -> dict[str, Any]:
+        """
+        执行多维置信度机器人判定。
+
+        Parameters
+        ----------
+        stage2_result    : 阶段二输出
+        filler_word_rate : 语气词占比（由 TopologyEngine 提供）
+
+        Returns
+        -------
+        dict[str, Any]
+            bot_score  : int           置信度得分 [0, 100]
+            bot_label  : BotLabel      BOT / HUMAN
+            veto_reason: str | None    一票否决原因（若触发）
+            details    : list[str]     评分细节
+        """
+        score: int   = 0
+        details: list[str] = []
+        all_intents: set[str] = {label for t in stage2_result.dialogue_turns for label in t.intent_labels}
+        full_text: str = " ".join(
+            t.merged_text for t in stage2_result.dialogue_turns
+            if not t.is_backchannel
+        )
+
+        # ── 一票否决检查（优先级最高）─────────────────────
+
+        # 否决 1：脏话/攻击性词汇
+        veto_word: str | None = self._check_profanity(full_text)
+        if veto_word:
+            return {
+                "bot_score": 0,
+                "bot_label": BotLabel.HUMAN,
+                "veto_reason": f"命中脏话/攻击性词汇：「{veto_word}」，强制标记为 HUMAN",
+                "details": ["PROFANITY_VETO"],
+            }
+
+        # 否决 2：复杂反问逻辑（受害者识破意图的反问）
+        if self._check_complex_rhetorical(stage2_result, all_intents):
+            return {
+                "bot_score": 0,
+                "bot_label": BotLabel.HUMAN,
+                "veto_reason": "检测到复杂反问逻辑（受害者主动反问+识破意图），强制标记为 HUMAN",
+                "details": ["COMPLEX_RETORT_VETO"],
+            }
+
+        # ── 加分项 ────────────────────────────────────────
+
+        # 加分 1：命中 csr_bot_whitelist
+        if "csr_bot_whitelist" in all_intents:
+            score += self._SCORE_CSR_WHITELIST
+            details.append(f"命中 csr_bot_whitelist → +{self._SCORE_CSR_WHITELIST}")
+
+        # 加分 2：极度流畅（语气词极少）
+        if filler_word_rate < self._FLUENCY_THRESHOLD:
+            score += self._SCORE_FLUENCY
+            details.append(
+                f"filler_word_rate={filler_word_rate:.4f} < {self._FLUENCY_THRESHOLD} → +{self._SCORE_FLUENCY}"
+            )
+
+        # 加分 3：ping_pong_rate 极度规律
+        ppr = stage2_result.interaction_features.negotiation_ping_pong_rate
+        # 机器人外呼的 ping_pong 通常为 0（独白）或极低
+        if ppr < 0.05:
+            score += self._SCORE_PING_PONG
+            details.append(
+                f"ping_pong_rate={ppr:.4f} < 0.05 → +{self._SCORE_PING_PONG}"
+            )
+
+        # ── 最终判定 ──────────────────────────────────────
+        bot_label = BotLabel.BOT if score > self._BOT_THRESHOLD else BotLabel.HUMAN
+        details.append(f"最终得分={score}，阈值={self._BOT_THRESHOLD}，判定={bot_label.value}")
+
+        return {
+            "bot_score":  score,
+            "bot_label":  bot_label,
+            "veto_reason": None,
+            "details":    details,
+        }
+
+    @staticmethod
+    def _check_profanity(text: str) -> str | None:
+        """检查文本是否命中 PROFANITY_REGISTRY，返回第一个命中的词或 None。"""
+        text_lower = text.lower()
+        for word in PROFANITY_REGISTRY:
+            if word.lower() in text_lower:
+                return word
+        return None
+
+    @staticmethod
+    def _check_complex_rhetorical(
+        stage2_result: StageTwoResult,
+        all_intents: set[str],
+    ) -> bool:
+        """
+        检测复杂反问逻辑。
+
+        判定条件：
+        1. 对话中存在 dismissal（识破）意图
+        2. 且存在 interrogation（反问）意图
+        3. 且 compliance_rate 极低（< 0.10）
+        三者同时满足 → 受害者在主动反击，判定为真人。
+        """
+        has_dismissal = "dismissal" in all_intents
+        has_interrogation = "interrogation" in all_intents
+        low_compliance = stage2_result.interaction_features.compliance_rate < 0.10
+
+        return has_dismissal and has_interrogation and low_compliance
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AdvancedVoicemailDetector —— 高级无效通话检测引擎
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class AdvancedVoicemailDetector:
+    """
+    高级无效通话（Voicemail/语音信箱/未接通）检测引擎。
+
+    评分规则（基础分 0，叠加计分）：
+      - 命中 Voicemail 正则词                → +60
+      - 角色 B 字数极短且符合模板             → +30
+      - 交互判定为 is_decoupled（解耦盲说）   → +20
+
+    一票否决（得分归零）：
+      - ping_pong_rate > 0.1 且不是解耦状态 → 判定为有效通话
+
+    最终得分 > 80 判定为无效通话。
+    """
+
+    # ── 评分阈值 ──────────────────────────────────────────
+    _VOICEMAIL_THRESHOLD: int = 80
+
+    # ── 加分权重 ──────────────────────────────────────────
+    _SCORE_VOICEMAIL_WORD:   int = 60
+    _SCORE_SHORT_TEMPLATE_B: int = 30
+    _SCORE_DECOUPLED:        int = 20
+
+    # ── 角色 B 短模板阈值 ─────────────────────────────────
+    _SHORT_B_WORD_THRESHOLD: int = 15  # 角色 B 总字数 < 15 视为极短
+
+    def evaluate(
+        self,
+        stage2_result: StageTwoResult,
+        is_decoupled: bool = False,
+    ) -> dict[str, Any]:
+        """
+        执行高级无效通话判定。
+
+        Parameters
+        ----------
+        stage2_result : 阶段二输出
+        is_decoupled  : 解耦盲说判定（由 TopologyEngine 提供）
+
+        Returns
+        -------
+        dict[str, Any]
+            voicemail_score : int           置信度得分 [0, 100]
+            is_voicemail    : bool          是否判定为无效通话
+            veto_reason     : str | None    一票否决原因
+            details         : list[str]     评分细节
+        """
+        score: int   = 0
+        details: list[str] = []
+        full_text: str = " ".join(
+            t.merged_text for t in stage2_result.dialogue_turns
+            if not t.is_backchannel
+        )
+
+        # ── 一票否决检查 ──────────────────────────────────
+        ppr = stage2_result.interaction_features.negotiation_ping_pong_rate
+        if ppr > 0.1 and not is_decoupled:
+            return {
+                "voicemail_score": 0,
+                "is_voicemail": False,
+                "veto_reason": (
+                    f"ping_pong_rate={ppr:.4f} > 0.1 且非解耦状态，"
+                    "判定为有效双向通话"
+                ),
+                "details": ["PING_PONG_VETO"],
+            }
+
+        # ── 加分项 ────────────────────────────────────────
+
+        # 加分 1：命中 Voicemail 正则词
+        voicemail_word = self._check_voicemail_words(full_text)
+        if voicemail_word:
+            score += self._SCORE_VOICEMAIL_WORD
+            details.append(f"命中 Voicemail 词「{voicemail_word}」→ +{self._SCORE_VOICEMAIL_WORD}")
+
+        # 加分 2：角色 B 字数极短且符合模板
+        if self._check_short_template_b(stage2_result):
+            score += self._SCORE_SHORT_TEMPLATE_B
+            details.append(
+                f"角色 B 字数极短（< {self._SHORT_B_WORD_THRESHOLD} 字）→ +{self._SCORE_SHORT_TEMPLATE_B}"
+            )
+
+        # 加分 3：解耦盲说状态
+        if is_decoupled:
+            score += self._SCORE_DECOUPLED
+            details.append(f"解耦盲说状态 (is_decoupled=True) → +{self._SCORE_DECOUPLED}")
+
+        # ── 最终判定 ──────────────────────────────────────
+        is_voicemail = score > self._VOICEMAIL_THRESHOLD
+        details.append(
+            f"最终得分={score}，阈值={self._VOICEMAIL_THRESHOLD}，"
+            f"判定={'无效通话' if is_voicemail else '有效通话'}"
+        )
+
+        return {
+            "voicemail_score": score,
+            "is_voicemail":  is_voicemail,
+            "veto_reason":    None,
+            "details":        details,
+        }
+
+    @staticmethod
+    def _check_voicemail_words(text: str) -> str | None:
+        """检查文本是否命中 Voicemail 正则词库，返回第一个命中的词或 None。"""
+        for word in _VOICEMAIL_REGEX_WORDS:
+            if word in text:
+                return word
+        return None
+
+    @staticmethod
+    def _check_short_template_b(stage2_result: StageTwoResult) -> bool:
+        """
+        检查是否存在「字数极短的角色 B」。
+
+        判定逻辑：
+        1. 找出字数占比最小的 speaker（角色 B）
+        2. 其总有效字数 < _SHORT_B_WORD_THRESHOLD
+        """
+        ifeats = stage2_result.interaction_features
+        word_dist = ifeats.speaker_word_ratio
+        if not word_dist:
+            return False
+
+        # 找字数占比最小的 speaker
+        min_sid = min(word_dist, key=lambda s: word_dist.get(s, 1.0))
+
+        # 计算该 speaker 的有效字数
+        total_words = sum(
+            t.word_count
+            for t in stage2_result.dialogue_turns
+            if t.speaker_id == min_sid and not t.is_backchannel
+        )
+
+        return total_words < 15 and total_words > 0

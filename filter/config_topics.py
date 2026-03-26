@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -99,7 +99,6 @@ class SyntaxRuleConfig:
     params:       dict[str, Any]    = field(default_factory=dict)
     evidence_key: str | None        = None  # 存放证据列表的键名，None=不保存证据
 
-from typing import Callable, Any  # 确保顶部有导入
 
 @dataclass
 class OODFallbackRule:
@@ -187,7 +186,7 @@ class TopicDefinition:
 OOD_FALLBACK_REGISTRY: list[OODFallbackRule] = [
     OODFallbackRule(
         rule_id="entity_sparsity",
-        delta=-15,
+        delta=-9,
         tag="global_business_sparse",
         reason="未命中任何高危主题，且全局业务实体极度稀疏，判定为无实质内容",
         # 依赖 NLP 硬句法探针的特征
@@ -195,7 +194,7 @@ OOD_FALLBACK_REGISTRY: list[OODFallbackRule] = [
     ),
     OODFallbackRule(
         rule_id="too_short_interaction",
-        delta=-20,
+        delta=-18,
         tag="global_too_short",
         reason="未命中高危主题，且有效交互轮次过少，判定为碎片废料",
         # 依赖拓扑引擎计算的有效交互轮次
@@ -203,7 +202,7 @@ OOD_FALLBACK_REGISTRY: list[OODFallbackRule] = [
     ),
     OODFallbackRule(
         rule_id="monologue_noise",
-        delta=-15,
+        delta=-6,
         tag="global_monologue_noise",
         reason="无效沟通：单方面输出且无实质性互动响应（如推销失败/自言自语）",
         # 依赖多维度的博弈互动指标综合判断
@@ -1153,6 +1152,14 @@ _TOPIC_REJECTION = TopicDefinition(
         "忙得很不说了",
         "改天再说",
         "以后有需要联系",
+        # 能力隔离/身份隔离（受害者抗性增强）
+        "不是本人",
+        "没带手机",
+        "不会操作",
+        "弄不来",
+        "手机不是我的",
+        "不识字",
+        "年纪大了",
         # 英文拒绝
         "I'm not interested",
         "No thanks",
@@ -1713,7 +1720,7 @@ _TOPIC_CORPORATE_LOGISTICS = TopicDefinition(
         )
     ],
     scoring_rules = ScoringRules(
-            standalone_score = -15,  # 基础降权
+            standalone_score = -4,   # 微降权（原 -15）
             standalone_tag   = "corporate_logistics_noise",
             matrix_combinations = [
                 MatrixCombination("has_coercive_threat", -15, "logistics_no_threat_noise", requires_absence=True),
@@ -1868,7 +1875,7 @@ _TOPIC_INDUSTRIAL_REPORT = TopicDefinition(
     ],
     syntax_rules  = [],
     scoring_rules = ScoringRules(
-        standalone_score = -20,   # 明确扣分，降低情报优先级
+        standalone_score = -5,    # 微降权，保留可能含实质内容的工业对话
         standalone_tag   = "low_value_industrial_noise",
     ),
 )
@@ -1928,7 +1935,7 @@ _TOPIC_CASUAL_CHAT = TopicDefinition(
     ],
     syntax_rules  = [],
     scoring_rules = ScoringRules(
-            standalone_score = -10,
+            standalone_score = -3,   # 微降权（原 -10）
             standalone_tag   = "low_value_casual_chat",
             matrix_combinations = [
                 # 闲聊且没有业务名词，双重确认是废话，狠狠打入深渊
@@ -1958,7 +1965,7 @@ _TOPIC_DELIVERY_EXPRESS = TopicDefinition(
     ],
     syntax_rules  = [],
     scoring_rules = ScoringRules(
-            standalone_score = -10,
+            standalone_score = -6,   # 微降权（原 -10）
             standalone_tag   = "low_value_casual_chat",
             matrix_combinations = [
                 # 闲聊且没有业务名词，双重确认是废话，狠狠打入深渊
@@ -1985,7 +1992,7 @@ _TOPIC_WRONG_NUMBER = TopicDefinition(
     ],
     syntax_rules  = [],
     scoring_rules = ScoringRules(
-        standalone_score = -10,
+        standalone_score = -8,   # 微降权（原 -10）
         standalone_tag   = "low_value_casual_chat",
         matrix_combinations = [
             # 闲聊且没有业务名词，绝对的纯废话
@@ -2059,6 +2066,30 @@ _TOPIC_GLOBAL_SYNTAX_REGISTRY = TopicDefinition(
     scoring_rules = ScoringRules(standalone_score=0)
 )
 
+
+
+# ─────────────────────────────────────────────────────────────
+# 全局脏话/攻击性词汇注册表（PROFANITY_REGISTRY）
+# ─────────────────────────────────────────────────────────────
+# 用于 BotConfidenceEngine 的一票否决机制：
+# 命中此词库的对话强制标记为 HUMAN（真人才会骂人/激烈反抗）
+PROFANITY_REGISTRY: list[str] = [
+    # 脏话/侮辱
+    "你有病", "神经病", "脑残", "智障", "傻逼", "脑子有坑",
+    "滚", "滚蛋", "去死", "死全家", "你妈的", "操你",
+    "王八蛋", "混蛋", "人渣", "废物", "垃圾",
+    "买腰子", "卖腰子",
+    # 攻击性/威胁
+    "报警", "起诉我", "告你", "投诉你", "举报你",
+    "骗子", "诈骗", "你是骗子", "死骗子",
+    # 激烈反驳
+    "证明给我看", "你证明一下", "拿证据来", "有证据吗",
+    "少来", "少废话", "别废话", "放屁", "扯淡", "胡说八道",
+    "闭嘴", "烦死了", "你有完没完",
+    # 英文脏话
+    "fuck you", "bullshit", "shut up", "go to hell",
+    "you're a scammer", "scam", "fraud",
+]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -29,6 +29,9 @@ except ImportError:
     _BGEM3_AVAILABLE = False
     BGEM3FlagModel = None  # type: ignore
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 降级编码器（无 GPU / CI 测试环境）

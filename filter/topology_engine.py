@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Sequence
 
 from models_stage2 import ASRRecord, DialogueTurn, TrackType
@@ -28,6 +29,18 @@ _BACKCHANNEL_WORDS: frozenset[str] = frozenset([
     "嗯嗯", "哦哦", "啊啊", "好的", "好", "行", "对", "对对",
     "对对对", "是", "是是", "嗯哼", "哈哈",
     "ok", "okay", "yeah", "yep", "uh-huh", "mhm",
+])
+
+# 语气词集合（用于 filler_word_rate 计算）
+_FILLER_WORDS: frozenset[str] = frozenset(
+    "嗯啊哦呢那个嘛呀哈哟喔唔嘿吧诶哇哦哦哦嗯嗯嗯啊啊啊"
+)
+
+# 指令性关键词（用于 is_decoupled 解耦盲说判定）
+_DIRECTIVE_KEYWORDS: frozenset[str] = frozenset([
+    "你", "您", "请", "马上", "立刻", "必须", "需要", "应该",
+    "给我", "帮", "提供", "输入", "发送", "点击", "下载",
+    "转账", "汇款", "验证码", "密码", "账户", "银行卡",
 ])
 
 # 中文字符计数正则（Unicode CJK 统一表意文字范围）
@@ -280,4 +293,202 @@ class TopologyAnalyzer:
         if total == 0:
             return {sid: 0.0 for sid in word_totals}
         return {sid: round(cnt / total, 4) for sid, cnt in word_totals.items()}
-    
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TopologyMetrics —— 拓扑特征度量快照
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass
+class TopologyMetrics:
+    """
+    对话拓扑多维度量快照，由 TopologyEngine 计算产出。
+
+    Attributes
+    ----------
+    filler_word_rate   : 语气词（嗯/啊/那个/呢）占总字数的比例
+    max_sentence_length: 单句最大字数（基于标点切分）
+    avg_sentence_length: 单句平均字数
+    is_decoupled       : 双方是否处于「解耦盲说」状态
+                         （一方命中指令性关键词，另一方无相关语义回应且持续高密度输出）
+    """
+    filler_word_rate:    float
+    max_sentence_length: int
+    avg_sentence_length: float
+    is_decoupled:        bool
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TopologyEngine —— 拓扑特征计算引擎
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 标点切分正则（中文句号/问号/叹号/分号 + 英文 . ! ? 及换行）
+_RE_SENTENCE_SPLIT: re.Pattern = re.compile(
+    r"[。！？；\n.!?]+"
+)
+
+
+class TopologyEngine:
+    """
+    对话拓扑特征计算引擎。
+
+    在 TopologyAnalyzer 的基础之上，提供更细粒度的统计度量，
+    供 BotConfidenceEngine 和 AdvancedVoicemailDetector 使用。
+
+    无状态设计，所有方法可并发安全调用。
+    """
+
+    def compute_metrics(self, turns: list[DialogueTurn]) -> TopologyMetrics:
+        """
+        对一组合并后的轮次计算全部拓扑度量。
+
+        Parameters
+        ----------
+        turns : list[DialogueTurn]
+            TopologyAnalyzer.merge_turns() 的输出。
+
+        Returns
+        -------
+        TopologyMetrics
+        """
+        return TopologyMetrics(
+            filler_word_rate    = self._compute_filler_word_rate(turns),
+            max_sentence_length = self._compute_max_sentence_length(turns),
+            avg_sentence_length = self._compute_avg_sentence_length(turns),
+            is_decoupled       = self._compute_is_decoupled(turns),
+        )
+
+    # ── 语气词占比 ──────────────────────────────────────────
+
+    @staticmethod
+    def _compute_filler_word_rate(turns: list[DialogueTurn]) -> float:
+        """
+        计算语气词（嗯/啊/那个/呢 等）占总字数的比例。
+
+        机器人外呼通常极度流畅（filler_word_rate < 0.005），
+        真人对话通常 > 0.02。
+        """
+        total_chars: int = 0
+        filler_chars: int = 0
+
+        for turn in turns:
+            if turn.is_backchannel:
+                continue
+            text = turn.merged_text
+            for ch in text:
+                if ch.isspace():
+                    continue
+                total_chars += 1
+                if ch in _FILLER_WORDS:
+                    filler_chars += 1
+
+        if total_chars == 0:
+            return 0.0
+        return round(filler_chars / total_chars, 6)
+
+    # ── 单句最大字数 ────────────────────────────────────────
+
+    @staticmethod
+    def _compute_max_sentence_length(turns: list[DialogueTurn]) -> int:
+        """基于标点切分，计算单句最大字数。"""
+        max_len: int = 0
+        for turn in turns:
+            if turn.is_backchannel:
+                continue
+            sentences = _RE_SENTENCE_SPLIT.split(turn.merged_text)
+            for sent in sentences:
+                sent = sent.strip()
+                if sent:
+                    wc = _count_words(sent)
+                    if wc > max_len:
+                        max_len = wc
+        return max_len
+
+    # ── 单句平均字数 ────────────────────────────────────────
+
+    @staticmethod
+    def _compute_avg_sentence_length(turns: list[DialogueTurn]) -> float:
+        """基于标点切分，计算单句平均字数。"""
+        sentence_lengths: list[int] = []
+        for turn in turns:
+            if turn.is_backchannel:
+                continue
+            sentences = _RE_SENTENCE_SPLIT.split(turn.merged_text)
+            for sent in sentences:
+                sent = sent.strip()
+                if sent:
+                    sentence_lengths.append(_count_words(sent))
+
+        if not sentence_lengths:
+            return 0.0
+        return round(sum(sentence_lengths) / len(sentence_lengths), 2)
+
+    # ── 解耦盲说判定 ────────────────────────────────────────
+
+    @staticmethod
+    def _compute_is_decoupled(turns: list[DialogueTurn]) -> bool:
+        """
+        判定双方是否处于「解耦盲说」状态。
+
+        判定条件（全部满足）：
+        1. 至少存在两个 speaker
+        2. 一方（dominant）的文本命中指令性关键词
+        3. 另一方（passive）的高密度输出（> 30% 字数占比）
+        4. dominant 的 ping_pong 节奏极低（< 0.1），即几乎无真正互动
+
+        典型场景：AI 客服盲播 → 受害者没在听 → 客服自顾自读话术
+        """
+        non_bc_turns = [t for t in turns if not t.is_backchannel]
+        if len(non_bc_turns) < 3:
+            return False
+
+        # 收集 speakers
+        speakers: list[str] = list(dict.fromkeys(t.speaker_id for t in non_bc_turns))
+        if len(speakers) < 2:
+            return False
+
+        # 计算各 speaker 字数
+        word_totals: dict[str, int] = {}
+        for turn in non_bc_turns:
+            word_totals[turn.speaker_id] = word_totals.get(turn.speaker_id, 0) + turn.word_count
+
+        total_words: int = sum(word_totals.values())
+        if total_words == 0:
+            return False
+
+        # 找出字数占比 > 30% 的双方
+        candidates = [
+            sid for sid, wc in word_totals.items()
+            if wc / total_words > 0.30
+        ]
+        if len(candidates) < 2:
+            return False
+
+        # 判定：是否存在一方命中指令性关键词而另一方没有语义回应
+        # 分别检查两方
+        directive_speaker: str | None = None
+        passive_speaker: str | None = None
+
+        for sid in candidates:
+            sid_text = " ".join(t.merged_text for t in non_bc_turns if t.speaker_id == sid)
+            has_directive = any(kw in sid_text for kw in _DIRECTIVE_KEYWORDS)
+            if has_directive and directive_speaker is None:
+                directive_speaker = sid
+            elif not has_directive and passive_speaker is None:
+                passive_speaker = sid
+
+        if directive_speaker is None or passive_speaker is None:
+            return False
+
+        # 验证 ping_pong 率极低（一方在持续高密度输出而不关心对方反应）
+        ping_pong_count: int = 0
+        for i in range(1, len(non_bc_turns) - 1):
+            if (
+                non_bc_turns[i - 1].speaker_id != non_bc_turns[i].speaker_id
+                and non_bc_turns[i].speaker_id != non_bc_turns[i + 1].speaker_id
+                and non_bc_turns[i - 1].speaker_id == non_bc_turns[i + 1].speaker_id
+            ):
+                ping_pong_count += 1
+
+        ping_pong_rate = ping_pong_count / max(len(non_bc_turns) - 2, 1)
+        return ping_pong_rate < 0.1

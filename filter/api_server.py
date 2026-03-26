@@ -14,7 +14,8 @@ from fastapi.responses import JSONResponse
 from models import ASRRecord, ConnectionStatus, BotLabel
 from stage_one_filter import StageOneFilter
 from stage_two_pipeline import StageTwoPipeline
-from stage_three_scorer import IntelligenceScorer
+from stage_three_scorer import IntelligenceScorer, BotConfidenceEngine, AdvancedVoicemailDetector
+from topology_engine import TopologyEngine
 
 # 初始化日志
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +26,9 @@ logger = logging.getLogger(__name__)
 filter_engine = StageOneFilter()
 pipeline_engine = StageTwoPipeline()
 scorer_engine = IntelligenceScorer()
+bot_engine = BotConfidenceEngine()
+voicemail_engine = AdvancedVoicemailDetector()
+topology_engine = TopologyEngine()
 
 app = FastAPI(title="V5.0 ASR Risk Control Engine", version="5.0.0")
 
@@ -132,8 +136,7 @@ async def analyze_conversation(req: AnalyzeRequest):
         
         valid_records = [
             r for r in s1_records 
-            if r.connection_status != ConnectionStatus.UNCONNECTED 
-            and r.bot_label != BotLabel.BOT
+            if r.connection_status != ConnectionStatus.UNCONNECTED
         ]
         
         if not valid_records:
@@ -162,6 +165,32 @@ async def analyze_conversation(req: AnalyzeRequest):
 
         # ── Step 4: 阶段三 (打分器裁决) ──
         final_result = scorer_engine.evaluate(stage2_result)
+
+        # ── Step 4.5: 多维置信度辅助判定 ──
+        # 计算 TopologyMetrics 供新引擎使用
+        topo_metrics = topology_engine.compute_metrics(stage2_result.dialogue_turns)
+        bot_result = bot_engine.evaluate(stage2_result, filler_word_rate=topo_metrics.filler_word_rate)
+        voicemail_result = voicemail_engine.evaluate(stage2_result, is_decoupled=topo_metrics.is_decoupled)
+
+        # 将辅助判定结果注入 final_result
+        final_result["bot_confidence"] = {
+            "bot_score": bot_result["bot_score"],
+            "bot_label": bot_result["bot_label"].value,
+            "veto_reason": bot_result["veto_reason"],
+            "details": bot_result["details"],
+        }
+        final_result["voicemail_detection"] = {
+            "voicemail_score": voicemail_result["voicemail_score"],
+            "is_voicemail": voicemail_result["is_voicemail"],
+            "veto_reason": voicemail_result["veto_reason"],
+            "details": voicemail_result["details"],
+        }
+        final_result["topology_metrics"] = {
+            "filler_word_rate": topo_metrics.filler_word_rate,
+            "max_sentence_length": topo_metrics.max_sentence_length,
+            "avg_sentence_length": topo_metrics.avg_sentence_length,
+            "is_decoupled": topo_metrics.is_decoupled,
+        }
 
         # ── Step 5: 组装标准出参 ──
         return StandardResponse(

@@ -49,7 +49,8 @@ from models_stage2 import ASRRecord, StageTwoResult
 # 阶段二：拓扑 + 意图 + 角色
 from stage_two_pipeline import StageTwoPipeline
 # 阶段三/四/五：规则打分
-from stage_three_scorer import IntelligenceScorer
+from stage_three_scorer import IntelligenceScorer, BotConfidenceEngine, AdvancedVoicemailDetector
+from topology_engine import TopologyEngine
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -131,9 +132,8 @@ def _route_record(record: ASRRecord) -> str:
     meta        = getattr(record, "metadata", {})
     s1          = meta.get("stage_one", {}) if isinstance(meta, dict) else {}
     p_unc:float = float(s1.get("p_unconnected", 0.0))
-    bot_lbl:str = str(s1.get("bot_label", "")).lower()
 
-    if p_unc > 0.8 or bot_lbl == "bot":
+    if p_unc > 0.8:
         return RouteDecision.LITE
 
     return RouteDecision.PASS
@@ -367,6 +367,11 @@ def run_pipeline(config: PipelineConfig) -> None:
     logger.info("[初始化] 加载 IntelligenceScorer（规则引擎）…")
     scorer = IntelligenceScorer()
 
+    logger.info("[初始化] 加载 BotConfidenceEngine + AdvancedVoicemailDetector + TopologyEngine…")
+    bot_engine = BotConfidenceEngine()
+    voicemail_engine = AdvancedVoicemailDetector()
+    topo_engine = TopologyEngine()
+
     # ── 确保输出目录存在 ──────────────────────────────────────
     output_path = Path(config.output_jsonl)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,6 +473,31 @@ def run_pipeline(config: PipelineConfig) -> None:
 
             # ── 阶段三/四/五：打分 ────────────────────────────
             intel: dict[str, Any] = scorer.evaluate(stage2_result)
+
+            # ── 阶段 3.5：多维置信度辅助判定 ──────────────────
+            topo_metrics = topo_engine.compute_metrics(stage2_result.dialogue_turns)
+            bot_result = bot_engine.evaluate(stage2_result, filler_word_rate=topo_metrics.filler_word_rate)
+            voicemail_result = voicemail_engine.evaluate(stage2_result, is_decoupled=topo_metrics.is_decoupled)
+
+            intel["bot_confidence"] = {
+                "bot_score": bot_result["bot_score"],
+                "bot_label": bot_result["bot_label"].value,
+                "veto_reason": bot_result["veto_reason"],
+                "details": bot_result["details"],
+            }
+            intel["voicemail_detection"] = {
+                "voicemail_score": voicemail_result["voicemail_score"],
+                "is_voicemail": voicemail_result["is_voicemail"],
+                "veto_reason": voicemail_result["veto_reason"],
+                "details": voicemail_result["details"],
+            }
+            intel["topology_metrics"] = {
+                "filler_word_rate": topo_metrics.filler_word_rate,
+                "max_sentence_length": topo_metrics.max_sentence_length,
+                "avg_sentence_length": topo_metrics.avg_sentence_length,
+                "is_decoupled": topo_metrics.is_decoupled,
+            }
+
             intel["_route"]        = "PASS"
             intel["_processed_at"] = datetime.utcnow().isoformat()
 
