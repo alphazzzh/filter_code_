@@ -42,8 +42,9 @@ class EngineState:
     cpu_pool: ThreadPoolExecutor
     gpu_semaphore: asyncio.Semaphore
     
-    # 👇 过载保护计数器
+    # 👇 过载保护计数器（配合 asyncio.Lock 保证原子性）
     active_requests: int = 0
+    _request_lock: Optional[asyncio.Lock] = None
 
 state = EngineState()
 
@@ -68,6 +69,8 @@ async def lifespan(app: FastAPI):
     
     # 严格限制进入 Stage2 推理的并发数，保护显存
     state.gpu_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GPU)
+    # 过载保护计数器的异步锁（必须在 event loop 内创建）
+    state._request_lock = asyncio.Lock()
 
     # 实例化所有引擎（加载 BGE 模型、LTP 模型等）
     state.stage1 = StageOneFilter()
@@ -135,21 +138,20 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
     企业级风控分析接口：严格的并发控制与超时降级机制。
     """
     # 👇 1. 全局过载保护 (Load Shedding / 快速熔断)
-    #    拦截器在解析任何 JSON 之前执行，保证消耗最小
-    if state.active_requests >= MAX_GLOBAL_REQUESTS:
-        logger.warning(
-            f"服务器触发过载保护！当前活跃请求: {state.active_requests}，"
-            f"已拒载 session_id: {req.session_id}"
-        )
-        response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
-        return StandardResponse(
-            status=429,
-            message="Server is at full capacity. Please try again later.",
-            session_id=req.session_id,
-        )
-
-    # 未满载，允许进入系统，计数器 +1
-    state.active_requests += 1
+    #    使用 asyncio.Lock 保证 active_requests 的检查与递增是原子操作
+    async with state._request_lock:
+        if state.active_requests >= MAX_GLOBAL_REQUESTS:
+            logger.warning(
+                f"服务器触发过载保护！当前活跃请求: {state.active_requests}，"
+                f"已拒载 session_id: {req.session_id}"
+            )
+            response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+            return StandardResponse(
+                status=429,
+                message="Server is at full capacity. Please try again later.",
+                session_id=req.session_id,
+            )
+        state.active_requests += 1
     
     try:
         logger.info(f"Received request for session_id: {req.session_id}")
@@ -211,12 +213,21 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
                 data={"final_score": 50, "tags": ["stage2_timeout_degraded"], "_error": "SLA Timeout"}
             )
         except Exception as stage_exc:
-            # 推理报错（如 OOM）平滑降级
+            # 推理报错（含 CUDA OOM）平滑降级
             logger.error(f"[{req.session_id}] Stage2 推理崩溃: {stage_exc}", exc_info=True)
+            # 🔧 显式处理 CUDA OOM：释放显存碎片，避免后续请求连锁失败
+            _exc_msg = str(stage_exc).lower()
+            if "out of memory" in _exc_msg or "cuda" in _exc_msg:
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                    logger.warning(f"[{req.session_id}] CUDA OOM 检测到，已执行 torch.cuda.empty_cache()")
+                except Exception as cuda_cleanup_err:
+                    logger.error(f"[{req.session_id}] CUDA 缓存清理失败: {cuda_cleanup_err}")
             response.status_code = status.HTTP_206_PARTIAL_CONTENT
             return StandardResponse(
                 status=206, message="Partial Content: Stage2 Error", session_id=req.session_id,
-                data={"final_score": 50, "tags": ["stage2_error_degraded"], "_error": str(stage_exc)}
+                data={"final_score": 50, "tags": ["stage2_error_degraded"], "_error": "Inference error (OOM or CUDA fault)"}
             )
 
         # ── Step 4: 阶段三打分与拓扑 (纯 CPU 极快计算，继续卸载) ──
@@ -241,8 +252,9 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
     except Exception as e:
         logger.error(f"处理 session_id: {req.session_id} 发生致命错误: {str(e)}", exc_info=True)
         response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-        return StandardResponse(status=500, message=f"Internal Server Error: {str(e)}", session_id=req.session_id)
+        return StandardResponse(status=500, message="Internal Server Error", session_id=req.session_id)
         
     finally:
-        # 👇 2. 无论请求是成功、失败、还是降级，离开系统时必须释放计数器
-        state.active_requests -= 1
+        # 👇 2. 无论请求是成功、失败、还是降级，离开系统时必须释放计数器（加锁保证原子性）
+        async with state._request_lock:
+            state.active_requests -= 1

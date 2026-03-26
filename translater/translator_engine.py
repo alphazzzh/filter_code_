@@ -2,15 +2,12 @@ import json
 import logging
 import re
 from typing import List
+from openai import AsyncOpenAI  
 from models_translation import DialogueTurn, TranslatedItem
 
 logger = logging.getLogger(__name__)
 
-
 class LLMTranslatorService:
-    """封装大语言模型上下文翻译逻辑的引擎层"""
-
-    # 核心策略：系统提示词强制大模型输出 JSON 数组
     SYSTEM_PROMPT = """\
 你是一位专业的多语言翻译助手，精通将各类语言翻译成简体中文。
 任务规则（严格遵守，不得违反）：
@@ -23,26 +20,24 @@ class LLMTranslatorService:
 [{"id":"content_001","content":"翻译结果一"},{"id":"content_002","content":"翻译结果二"}]
 """
 
+    def __init__(self):
+        # 在类初始化时全局创建一次客户端，复用底层连接池
+        self.client = AsyncOpenAI(
+            base_url="http://localhost:8000/v1",  
+            api_key="EMPTY"                       
+        )
+
     def build_user_prompt(self, dialogue_turns: List[DialogueTurn]) -> str:
-        """将结构化的对话数据转为 JSON 字符串发给大模型"""
-        payload = [
-            {"id": turn.id, "speaker": turn.speaker, "content": turn.content}
-            for turn in dialogue_turns
-        ]
+        payload = [{"id": turn.id, "speaker": turn.speaker, "content": turn.content} for turn in dialogue_turns]
         return json.dumps(payload, ensure_ascii=False)
 
-    def call_llm(self, user_prompt: str) -> str:
-        from openai import OpenAI
-        import os
-
-        # 1. 将客户端指向本地启动的服务地址
-        client = OpenAI(
-            base_url="http://localhost:8000/v1",  # 👉 替换为你本地服务的真实 IP 和 端口
-            api_key="EMPTY"                       # 👉 本地服务通常不需要 Key，随便填一个占位符即可，防止库报错
-        )
+    async def call_llm(self, user_prompt: str) -> str:
+        """ 👈 修改为 async 函数 """
+        logger.info("[LLM] 发起异步翻译请求，prompt 长度：%d", len(user_prompt))
         
-        response = client.chat.completions.create(
-            model="你的本地模型名称",               # 👉 替换为你本地加载的模型名，例如 "Qwen1.5-14B-Chat", "llama3"
+        # 使用 await 等待异步网络 I/O，绝不阻塞主线程
+        response = await self.client.chat.completions.create(
+            model="你的本地模型名称",               
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
@@ -50,109 +45,43 @@ class LLMTranslatorService:
             temperature=0.2,
         )
         return response.choices[0].message.content
-        """
-        # ② Anthropic Claude
-        # import anthropic
-        # client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        # message = client.messages.create(
-        #     model="claude-opus-4-6",
-        #     max_tokens=4096,
-        #     system=self.SYSTEM_PROMPT,
-        #     messages=[{"role": "user", "content": user_prompt}],
-        # )
-        # return message.content[0].text
-        -------------------------------------------------------
-        """
-        logger.info("[LLM] 收到翻译请求，输入 prompt 长度：%d 字符", len(user_prompt))
 
-        # 本地占位符存根（测试联调使用，假装是大模型返回的数据）
-        turns: list[dict] = json.loads(user_prompt)
-        stub_result = [{"id": t["id"], "content": f"【大模型机翻】{t['content']}"} for t in turns]
-        return json.dumps(stub_result, ensure_ascii=False)
-
-    def _strip_markdown_fences(self, raw: str) -> str:
+    def _extract_json_array(self, raw: str) -> str:
         """
-        兜底清除大模型可能抽风输出的 Markdown 代码块标记。
-        例如：```json\\n[...]\\n``` → [...]
+        强力正则，无视大模型的废话，直接提取第一对 [ ] 及其内部内容
         """
-        # 移除形如 ```json ... ``` 或 ``` ... ``` 的包裹
-        cleaned = re.sub(r"```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        cleaned = cleaned.replace("```", "")
-        return cleaned.strip()
+        match = re.search(r'\[\s*\{.*?\}\s*\]', raw, re.DOTALL)
+        if match:
+            return match.group(0)
+        # 如果正则没找到，原样返回，交由 json.loads 报错处理
+        return raw.strip()
 
-    def translate(self, dialogue_turns: List[DialogueTurn]) -> List[TranslatedItem]:
-        """
-        主入口：执行全文上下文翻译，返回按 id 映射的翻译结果列表。
-
-        执行流程：
-          1. 将完整对话序列化为 user prompt（一次性提交，保留上下文）
-          2. 调用 LLM，获取原始字符串输出
-          3. 剥离 Markdown 代码块标记
-          4. json.loads 解析为 List[dict]
-          5. 校验每个元素包含 id 与 content 字段
-          6. 按原始输入顺序做 id 映射，返回 TranslatedItem 列表
-
-        核心原则：绝对不在此处使用 for 循环逐句调用 LLM，
-        必须整段对话一次性提交以保证翻译上下文连贯性。
-        """
-        # ----------------------------------------------------------------
-        # Step 1：构建整段对话的 user prompt，一次性提交给 LLM
-        # ----------------------------------------------------------------
+    async def translate(self, dialogue_turns: List[DialogueTurn]) -> List[TranslatedItem]:
+        """ 👈 修改为 async 函数 """
         user_prompt = self.build_user_prompt(dialogue_turns)
-        logger.info("发送 %d 条对话至 LLM 进行整体上下文翻译", len(dialogue_turns))
+        
+        # 1. 异步等待 LLM 响应
+        raw_output = await self.call_llm(user_prompt)
+        
+        # 2. 强力提取 JSON 数组
+        cleaned_output = self._extract_json_array(raw_output)
 
-        # ----------------------------------------------------------------
-        # Step 2：调用 LLM，获取原始字符串输出
-        # ----------------------------------------------------------------
-        raw_output = self.call_llm(user_prompt)
-        logger.debug("LLM 原始输出（前500字）：%s", raw_output[:500])
-
-        # ----------------------------------------------------------------
-        # Step 3：剥离 LLM 可能残留的 Markdown 标记
-        # ----------------------------------------------------------------
-        cleaned_output = self._strip_markdown_fences(raw_output)
-
-        # ----------------------------------------------------------------
-        # Step 4：将清理后的字符串解析为 Python 对象
-        # ----------------------------------------------------------------
         try:
             parsed: list = json.loads(cleaned_output)
         except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"LLM 输出无法解析为合法 JSON：{exc}；"
-                f"清理后输出片段：{cleaned_output[:200]}"
-            ) from exc
+            raise ValueError(f"LLM 输出无法解析为合法 JSON：{exc}；片段：{cleaned_output[:200]}") from exc
 
         if not isinstance(parsed, list):
-            raise ValueError(
-                f"LLM 输出应为 JSON 数组，实际得到：{type(parsed).__name__}"
-            )
+            raise ValueError(f"LLM 输出应为 JSON 数组，实际得到：{type(parsed).__name__}")
 
-        # ----------------------------------------------------------------
-        # Step 5：校验每个元素结构，并构建 id → translated_content 映射
-        # ----------------------------------------------------------------
-        translation_map: dict[str, str] = {}
-        for item in parsed:
-            if not isinstance(item, dict):
-                raise ValueError(f"翻译结果元素不是 JSON 对象：{item}")
-            if "id" not in item or "content" not in item:
-                raise ValueError(
-                    f"翻译结果元素缺少必要字段 id 或 content：{item}"
-                )
-            translation_map[str(item["id"])] = str(item["content"])
+        translation_map = {str(item.get("id", "")): str(item.get("content", "")) for item in parsed if isinstance(item, dict)}
 
-        # ----------------------------------------------------------------
-        # Step 6：严格按原始输入顺序输出，缺失条目记录 warning 并空串兜底
-        # ----------------------------------------------------------------
         result: List[TranslatedItem] = []
         for turn in dialogue_turns:
             translated_text = translation_map.get(turn.id)
             if translated_text is None:
-                logger.warning(
-                    "LLM 输出中缺少 id=%s 的翻译结果，使用空字符串兜底", turn.id
-                )
+                logger.warning("缺少 id=%s 的翻译结果，使用空字符串兜底", turn.id)
                 translated_text = ""
             result.append(TranslatedItem(id=turn.id, content=translated_text))
 
-        logger.info("翻译完成，共返回 %d 条结果", len(result))
         return result

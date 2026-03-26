@@ -50,7 +50,7 @@ async def translate_endpoint(raw_request: Request) -> JSONResponse:
         # ========================================================
         # 2. 抛给后端算法引擎执行整段上下文翻译
         # ========================================================
-        translated_items = _translator.translate(req.data.content)
+        translated_items = await _translator.translate(req.data.content)
 
         # ========================================================
         # 3. 封装标准成功响应
