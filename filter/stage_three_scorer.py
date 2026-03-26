@@ -567,7 +567,7 @@ class IntelligenceScorer:
 
         ifeats = result.interaction_features
 
-        return {
+        output_dict = {
             "conversation_id":      result.conversation_id,
             "final_score":          final_score,
             "tags":                 sorted(ctx.tags),
@@ -585,6 +585,12 @@ class IntelligenceScorer:
                 for e in ctx.events
             ],
         }
+
+        # 透传阶段二动态检索结果（dynamic_topic → BGE 矩阵相似度 → dynamic_search）
+        if "dynamic_search" in result.metadata:
+            output_dict["dynamic_search"] = result.metadata["dynamic_search"]
+
+        return output_dict
     
     def _run_ood_fallback(
         self, 

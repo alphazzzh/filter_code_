@@ -22,6 +22,13 @@ from stage_two_pipeline import StageTwoPipeline
 from stage_three_scorer import IntelligenceScorer, BotConfidenceEngine, AdvancedVoicemailDetector
 from topology_engine import TopologyEngine
 
+# CUDA 显存管理（可选依赖，无 torch 时不影响服务启动）
+try:
+    import torch
+    _HAS_TORCH_CUDA = hasattr(torch, "cuda") and torch.cuda.is_available()
+except ImportError:
+    _HAS_TORCH_CUDA = False
+
 # 初始化日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -218,12 +225,14 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
             # 🔧 显式处理 CUDA OOM：释放显存碎片，避免后续请求连锁失败
             _exc_msg = str(stage_exc).lower()
             if "out of memory" in _exc_msg or "cuda" in _exc_msg:
-                try:
-                    import torch
-                    torch.cuda.empty_cache()
-                    logger.warning(f"[{req.session_id}] CUDA OOM 检测到，已执行 torch.cuda.empty_cache()")
-                except Exception as cuda_cleanup_err:
-                    logger.error(f"[{req.session_id}] CUDA 缓存清理失败: {cuda_cleanup_err}")
+                if _HAS_TORCH_CUDA:
+                    try:
+                        torch.cuda.empty_cache()
+                        logger.warning(f"[{req.session_id}] CUDA OOM 检测到，已执行 torch.cuda.empty_cache()")
+                    except Exception as cuda_cleanup_err:
+                        logger.error(f"[{req.session_id}] CUDA 缓存清理失败: {cuda_cleanup_err}")
+                else:
+                    logger.warning(f"[{req.session_id}] 检测到 CUDA 异常但 torch 不可用，跳过显存清理")
             response.status_code = status.HTTP_206_PARTIAL_CONTENT
             return StandardResponse(
                 status=206, message="Partial Content: Stage2 Error", session_id=req.session_id,
