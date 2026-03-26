@@ -615,7 +615,7 @@ class StageTwoPipeline:
                     search_chunks=search_chunks, 
                     dynamic_topic=dynamic_topic,
                     default_threshold=0.65,
-                    top_k=10  # 请求返回前 10 个高分片段
+                    top_k=1  
                 )
             else:
                 # 对话全是废话/静音，直接返回未匹配

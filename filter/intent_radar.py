@@ -34,6 +34,34 @@ logger = logging.getLogger(__name__)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 语义滑窗切片（Semantic Sliding Window）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 默认滑窗参数：窗口=20 字符，步长=10 字符
+_DEFAULT_WINDOW_SIZE: int = 20
+_DEFAULT_STRIDE:      int = 10
+
+
+def _sliding_window(
+    text: str,
+    window_size: int = _DEFAULT_WINDOW_SIZE,
+    stride: int = _DEFAULT_STRIDE,
+) -> list[str]:
+    """
+    将长文本按滑窗切片为多个短片段，解决核心意图被向量空间稀释的问题。
+
+    算法：
+    - 文本长度 <= window_size → 返回原文本（无需切片）
+    - 否则按 stride 步长滑动，生成多个重叠片段
+
+    性能：纯字符串切片，O(n) 时间复杂度，无正则开销。
+    """
+    if len(text) <= window_size:
+        return [text]
+    return [text[i:i + window_size] for i in range(0, len(text), stride)]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 降级编码器（无 GPU / CI 测试环境）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -202,21 +230,55 @@ class IntentRadar:
         self, texts: list[str]
     ) -> list[dict[str, float]]:
         """
-        Q(B×d) × A^T(d×n) → sim(B×n)，取行最大值 → (B,) 激活强度。
+        语义滑窗 + Max 聚合相似度计算。
+
+        算法：
+        1. 对每个输入文本执行滑窗切片（短文本不切片）
+        2. 所有切片扁平化后一次性批量编码（最大化 GPU 利用率）
+        3. 对每个原始文本，取其所有切片与锚点矩阵的相似度 Max 值
+
+        优势：
+        - 长语音中核心意图不会被周围废料稀释向量表示
+        - 高浓度语义片段能瞬间击穿阈值
         """
-        encoded     = self._model.encode(
-            texts,
-            batch_size=min(self._batch_size, len(texts)),
+        if not texts or not self._anchor_matrices:
+            return [{} for _ in texts]
+
+        # ── Step 1: 对每个文本执行滑窗切片 ───────────────────
+        all_chunks: list[str] = []              # 扁平化的全部切片
+        chunk_map:   list[list[int]] = []       # chunk_map[i] = 该文本对应的切片索引范围 [start, end)
+
+        for text in texts:
+            chunks = _sliding_window(text)
+            start = len(all_chunks)
+            all_chunks.extend(chunks)
+            chunk_map.append((start, len(all_chunks)))
+
+        if not all_chunks:
+            return [{} for _ in texts]
+
+        # ── Step 2: 一次性批量编码（GPU 利用率最大化）───────
+        encoded = self._model.encode(
+            all_chunks,
+            batch_size=min(self._batch_size, len(all_chunks)),
             max_length=512,
         )
         query_vecs: np.ndarray = encoded["dense_vecs"]
+
+        # ── Step 3: 对每个 topic_id 计算相似度矩阵 + Max 聚合 ──
         all_scores: list[dict[str, float]] = [{} for _ in texts]
 
         for topic_id, anchor_mat in self._anchor_matrices.items():
-            sim_mat    = cosine_similarity(query_vecs, anchor_mat)
-            max_scores = sim_mat.max(axis=1)
-            for i, score in enumerate(max_scores):
-                all_scores[i][topic_id] = round(float(score), 4)
+            # (total_chunks × anchor_count) 相似度矩阵
+            sim_mat = cosine_similarity(query_vecs, anchor_mat)  # (C, A)
+
+            # 对每个原始文本，取其所有切片的最大相似度
+            for text_idx, (start, end) in enumerate(chunk_map):
+                if start >= end:
+                    continue
+                chunk_sims = sim_mat[start:end]  # (num_chunks_for_this_text, A)
+                max_sim = float(chunk_sims.max())
+                all_scores[text_idx][topic_id] = round(max_sim, 4)
 
         return all_scores
     

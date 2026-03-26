@@ -250,6 +250,8 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
         # ── Step 3: 阶段二 (GPU 计算密集，使用 Semaphore 排队 + 超时熔断) ──
         # 将 nlp_features_extra 注入 extra_metadata，随 stage2 结果流到 scorer
         extra_meta = {"dynamic_topic": req.dynamic_topic} if req.dynamic_topic else {}
+        nlp_features_extra["filler_word_rate"] = topo_metrics.filler_word_rate
+        nlp_features_extra["is_decoupled"] = topo_metrics.is_decoupled
         extra_meta["nlp_features_extra"] = nlp_features_extra
         stage2_func = partial(
             state.stage2.process_conversation,

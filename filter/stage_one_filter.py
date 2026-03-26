@@ -6,7 +6,6 @@
 # ─────────────────────────────────────────────────────────────
 #  Normalizer          : NFKC 归一化 + 标点压缩（纯文本变换）
 #  BotFeatureExtractor : 语气词占比 + 前缀锚点（只读，不修改文本）
-#  UnconnectedDetector : F_len / F_ent / F_entity + 融合概率计算
 #  LIDRouter           : fastText 语种识别 + 短文本回退
 #  ASRErrorCorrector   : 多语言 ASR 容错（中文拼音 / 英文 Double Metaphone）
 #  StageOneFilter      : 编排以上子模块，输出填充完整的 ASRRecord
@@ -14,13 +13,10 @@
 
 from __future__ import annotations
 
-import math
 import re
 import unicodedata
 from pathlib import Path
 from typing import Optional
-import math
-from collections import Counter
 
 # ── 第三方库 ──────────────────────────────────────────────────
 try:
@@ -30,7 +26,6 @@ except ImportError:
     _FASTTEXT_AVAILABLE = False
 
 import jellyfish          # Double Metaphone, Soundex 等
-from flashtext import KeywordProcessor
 from pypinyin import lazy_pinyin  # 中文拼音转写
 
 from models import (
@@ -38,7 +33,6 @@ from models import (
     BotFeatures,
     BotLabel,
     ConnectionStatus,
-    UnconnectedFeatures,
 )
 
 
@@ -149,128 +143,9 @@ class BotFeatureExtractor:
             return BotLabel.UNCERTAIN
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 3. UnconnectedDetector —— 未接通概率计算
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# 默认业务敏感词表
-_DEFAULT_ENTITY_KEYWORDS: list[str] = [
-    # 金融类
-    "钱", "转账", "汇款", "贷款", "利息", "还款", "余额", "账户",
-    "验证码", "密码", "银行卡", "信用卡",
-    # 业务高危词
-    "先生", "女士", "您好", "合同", "订单", "快递", "发票",
-    # 金额符号
-    "元", "万", "块", "￥",
-    # 英文业务词
-    "account", "payment", "invoice", "transfer", "verify",
-]
-
-# 融合权重常量
-_ALPHA: float = 0.7   # 长度特征权重
-_BETA:  float = 0.3   # 熵特征权重
-_LEN_THRESHOLD: int = 30          # F_len 归零阈值（字符数）
-_UNCONNECTED_THRESHOLD: float = 0.75  # 标记为未接通的概率下限
-
-
-def _compute_f_len(text: str, threshold: int = _LEN_THRESHOLD) -> float:
-    """
-    文本长度特征。
-    公式：max(0, 1 - len(text) / threshold)
-    文本越短，值越接近 1；超过阈值则归零。
-    """
-    return max(0.0, 1.0 - len(text) / threshold)
-
-
-def _compute_shannon_entropy(text: str) -> float:
-    """计算字符级香农熵 H(X)"""
-    if not text:
-        return 0.0
-    length = len(text)
-    counts = Counter(text)
-    return -sum((c / length) * math.log2(c / length) for c in counts.values())
-
-def _compute_f_ent(text: str, epsilon: float = 1e-6) -> float:
-    """
-    基于香农熵的信息匮乏度惩罚。
-    正常人类交谈的熵值通常 > 3.5；当满篇都是“嗯嗯好的”、“我我我”时，熵值极低。
-    熵值越低，返回的惩罚系数越接近 1。
-    """
-    entropy = _compute_shannon_entropy(text)
-    return max(0.0, 1.0 - (entropy / 3.5))
-
-
-class UnconnectedDetector:
-    """
-    未接通概率计算器。
-    使用 FlashText 进行 O(n) 业务词探针匹配，
-    避免对每条文本重复编译正则。
-    """
-
-    def __init__(
-        self,
-        entity_keywords: Optional[list[str]] = None,
-        len_threshold: int = _LEN_THRESHOLD,
-        alpha: float = _ALPHA,
-        beta: float = _BETA,
-        unconnected_threshold: float = _UNCONNECTED_THRESHOLD,
-    ) -> None:
-        self._len_threshold = len_threshold
-        self._alpha = alpha
-        self._beta = beta
-        self._unconnected_threshold = unconnected_threshold
-
-        # ── FlashText 关键词处理器（一次构建，反复复用）──────
-        self._kp = KeywordProcessor(case_sensitive=False)
-        keywords = entity_keywords or _DEFAULT_ENTITY_KEYWORDS
-        for kw in keywords:
-            self._kp.add_keyword(kw)
-
-    def compute(self, text: str) -> tuple[UnconnectedFeatures, ConnectionStatus]:
-        """
-        计算三项特征并融合为最终概率，返回特征包 + 连接状态标签。
-
-        Returns
-        -------
-        (UnconnectedFeatures, ConnectionStatus)
-        """
-        # ── F_entity：FlashText O(n) 匹配 ─────────────────────
-        matched: list[str] = self._kp.extract_keywords(text)
-        f_entity: float = 0.0 if matched else 1.0
-
-        # ── F_len ──────────────────────────────────────────────
-        f_len: float = _compute_f_len(text, self._len_threshold)
-
-        # ── F_ent ──────────────────────────────────────────────
-        f_ent: float = _compute_f_ent(text)
-
-        # ── 融合概率 ───────────────────────────────────────────
-        p: float = round(
-            f_entity * (self._alpha * f_len + self._beta * f_ent), 4
-        )
-
-        features = UnconnectedFeatures(
-            f_len=round(f_len, 4),
-            f_ent=round(f_ent, 4),
-            f_entity=f_entity,
-            p_unconnected=p,
-        )
-
-        # ── 决策 ───────────────────────────────────────────────
-        if p > self._unconnected_threshold:
-            status = ConnectionStatus.UNCONNECTED
-        elif p < 0.4:
-            # 概率足够低，判定为接通
-            status = ConnectionStatus.CONNECTED
-        else:
-            # 模糊地带，保留人工复核
-            status = ConnectionStatus.UNCERTAIN
-
-        return features, status
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 4. LIDRouter —— 语种识别与路由
+# 3. LIDRouter —— 语种识别与路由
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _SHORT_TEXT_THRESHOLD: int = 10   # 字符数低于此值时跳过 LID
@@ -344,7 +219,7 @@ class LIDRouter:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 5. ASRErrorCorrector —— 多语言 ASR 容错
+# 4. ASRErrorCorrector —— 多语言 ASR 容错
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ── 中文结巴去重正则（预编译）──────────────────────────────────
@@ -475,7 +350,7 @@ class ASRErrorCorrector:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 6. StageOneFilter —— 阶段一流水线编排
+# 5. StageOneFilter —— 阶段一流水线编排
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class StageOneFilter:
@@ -498,7 +373,6 @@ class StageOneFilter:
     def __init__(
         self,
         fasttext_model_path: str | Path = "lid.176.bin",
-        entity_keywords: Optional[list[str]] = None,
         filler_words: Optional[frozenset[str]] = None,
     ) -> None:
         # 子模块实例化（各自在 __init__ 中完成昂贵资源的预加载）

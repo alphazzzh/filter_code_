@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+import math
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +38,7 @@ from config_topics import (
     get_topics_by_category,
     OOD_FALLBACK_REGISTRY,
     PROFANITY_REGISTRY,
+    GLOBAL_REDLINE_REGISTRY,
 )
 from models import BotLabel
 
@@ -224,6 +228,47 @@ class IntelligenceScorer:
         """
         对一条阶段二输出执行完整共现矩阵打分。
         """
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 零号优先级：全局红线前置熔断（Redline Pre-Circuit Breaker）
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 在任何复杂矩阵运算之前，极速扫描底线安全词汇。
+        # 触发时直接判死，绕过大模型全链路。
+        full_text = " ".join(
+            t.effective_text if hasattr(t, 'effective_text') and t.effective_text
+            else (t.merged_text if hasattr(t, 'merged_text') else "")
+            for t in stage2_result.dialogue_turns
+            if not t.is_backchannel
+        )
+        if full_text:
+            for redline_pattern in GLOBAL_REDLINE_REGISTRY:
+                if redline_pattern.search(full_text):
+                    return {
+                        "conversation_id":      stage2_result.conversation_id,
+                        "final_score":          100,
+                        "tags":                 ["GLOBAL_REDLINE_ALERT"],
+                        "tags_suppressed":      [],
+                        "track_type":           stage2_result.track_type.value,
+                        "roles":                {r.speaker_id: r.role.value for r in stage2_result.speaker_roles},
+                        "nlp_features_summary": {},
+                        "interaction_summary": {
+                            "ping_pong_rate":   stage2_result.interaction_features.negotiation_ping_pong_rate,
+                            "compliance_rate":  stage2_result.interaction_features.compliance_rate,
+                            "resistance_decay": stage2_result.interaction_features.resistance_decay,
+                            "word_distribution":stage2_result.interaction_features.speaker_word_ratio,
+                        },
+                        "score_breakdown": [
+                            {
+                                "delta": 50,
+                                "tag": "GLOBAL_REDLINE_ALERT",
+                                "reason": (
+                                    "触发全局红线探针前置熔断，通话被立即阻断。"
+                                    "系统侦测到绝对违规词汇，绕过大模型直接判死。"
+                                ),
+                            }
+                        ],
+                        "redline_triggered": True,
+                    }
+
         ctx = _ScoringContext()
 
         # 🚨 缺陷 1 修复：阶段一硬正则极高危拦截兜底
@@ -441,12 +486,12 @@ class IntelligenceScorer:
         csr_bot_whitelist:    传统机器人白名单，百分比折扣。
         """
         for tid, td in self._whitelist_topics.items():
-            if tid == "inbound_official_ivr":
+            if tid in ("inbound_official_ivr", "inbound_user_request"):
                 if tid in all_intents:
                     ctx.apply(
                         delta  = td.scoring_rules.standalone_score,
                         tag    = td.scoring_rules.standalone_tag,
-                        reason = f"命中超级白名单 [{tid}]（官方客服呼入），强制降权防误杀",
+                        reason = f"命中安全白名单 [{tid}]，强制降权防误杀",
                     )
 
             elif tid == "csr_bot_whitelist":
@@ -617,19 +662,25 @@ class IntelligenceScorer:
         is_bot_signal = False
         s1_meta = result.metadata.get("stage_one", {})
 
+        # ── 短文本保护：计算非 backchannel 轮次总数和总字数 ──
+        non_bc_turns = [t for t in result.dialogue_turns if not t.is_backchannel]
+        total_words = sum(t.word_count for t in non_bc_turns)
+
         # 信号 1：阶段一 bot_label == BOT
         if s1_meta.get("bot_label") == BotLabel.BOT.value:
             is_bot_signal = True
 
         # 信号 2：ping_pong_rate < 0.1（几乎无真正交互）
+        # 修复：只有当存在至少 4 个轮次时，ping_pong 为 0 才是不正常的机器单向输出
         ppr = result.interaction_features.negotiation_ping_pong_rate
-        if ppr < 0.1:
+        if ppr < 0.1 and len(non_bc_turns) >= 4:
             is_bot_signal = True
 
         # 信号 3：filler_word_rate < 0.005（极度流畅）
+        # 修复：只有当对话总字数 >= 30 时，0 结巴率才有判定意义
         nlp_extra = result.metadata.get("nlp_features_extra", {})
         fwr = nlp_extra.get("filler_word_rate", 1.0)  # 默认 1.0（真人水平）
-        if fwr < 0.005:
+        if fwr < 0.005 and total_words >= 30:
             is_bot_signal = True
 
         if not is_bot_signal:
@@ -960,9 +1011,71 @@ class BotConfidenceEngine:
 # AdvancedVoicemailDetector —— 高级无效通话检测引擎
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# ── 轻量级 TF-IDF 余弦相似度（无需 GPU / BGE 模型）────────────
+
+# 预编译中文分词正则（字符级 bigram，适用于中文/日文等多语言场景）
+_RE_TOKENIZER: re.Pattern = re.compile(
+    r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]|[a-zA-Z]+",
+    re.UNICODE,
+)
+
+
+def _tfidf_cosine_similarity(text_a: str, text_b: str) -> float:
+    """
+    轻量级 TF-IDF 余弦相似度计算。
+
+    使用字符级 bigram + IDF 近似（基于文档频率的简单折扣），
+    无需外部依赖，O(n) 时间复杂度。
+
+    适用场景：跨轮次连贯度判定（两句话是否在语义上相关）
+    不适用：需要深度语义理解的场景（请使用 BGE-M3）
+    """
+    def _tokenize(text: str) -> list[str]:
+        return _RE_TOKENIZER.findall(text.lower())
+
+    def _ngrams(tokens: list[str]) -> Counter[str]:
+        grams: list[str] = []
+        for i in range(len(tokens) - 1):
+            grams.append(f"{tokens[i]}_{tokens[i + 1]}")
+        return Counter(grams)
+
+    ngrams_a = _ngrams(_tokenize(text_a))
+    ngrams_b = _ngrams(_tokenize(text_b))
+
+    if not ngrams_a or not ngrams_b:
+        return 0.0
+
+    # 简单 IDF 折扣：仅出现在一个文档中的 bigram 权重更高
+    all_keys = set(ngrams_a.keys()) | set(ngrams_b.keys())
+    idf: dict[str, float] = {}
+    for k in all_keys:
+        df = (1 if k in ngrams_a else 0) + (1 if k in ngrams_b else 0)
+        idf[k] = math.log(2.0 / df) + 1.0  # 平滑 IDF
+
+    # TF-IDF 加权向量
+    def _to_tfidf_vec(ngrams: Counter[str]) -> dict[str, float]:
+        total = sum(ngrams.values()) or 1.0
+        return {k: (v / total) * idf[k] for k, v in ngrams.items()}
+
+    vec_a = _to_tfidf_vec(ngrams_a)
+    vec_b = _to_tfidf_vec(ngrams_b)
+
+    # 余弦相似度
+    dot_product = sum(vec_a[k] * vec_b.get(k, 0.0) for k in vec_a)
+    norm_a = math.sqrt(sum(v ** 2 for v in vec_a.values()))
+    norm_b = math.sqrt(sum(v ** 2 for v in vec_b.values()))
+
+    if norm_a < 1e-9 or norm_b < 1e-9:
+        return 0.0
+
+    return dot_product / (norm_a * norm_b)
+
+
 class AdvancedVoicemailDetector:
     """
     高级无效通话（Voicemail/语音信箱/未接通）检测引擎。
+
+    V5.1 重构：废除字数统计防线，引入跨轮次语义连贯度测算。
 
     评分规则（基础分 0，叠加计分）：
       - 命中 Voicemail 正则词                → +60
@@ -971,6 +1084,7 @@ class AdvancedVoicemailDetector:
 
     一票否决（得分归零）：
       - ping_pong_rate > 0.1 且不是解耦状态 → 判定为有效通话
+      - 跨轮次语义连贯度 > 0.35 → 检测到真交互，推翻无效通话判定
 
     最终得分 > 80 判定为无效通话。
     """
@@ -982,6 +1096,9 @@ class AdvancedVoicemailDetector:
     _SCORE_VOICEMAIL_WORD:   int = 60
     _SCORE_SHORT_TEMPLATE_B: int = 30
     _SCORE_DECOUPLED:        int = 20
+
+    # ── 语义连贯度阈值 ──────────────────────────────────
+    _CROSS_TURN_SIM_THRESHOLD: float = 0.35  # 跨轮次语义耦合阈值
 
     # ── 角色 B 短模板阈值 ─────────────────────────────────
     _SHORT_B_WORD_THRESHOLD: int = 15  # 角色 B 总字数 < 15 视为极短
@@ -1014,7 +1131,7 @@ class AdvancedVoicemailDetector:
             if not t.is_backchannel
         )
 
-        # ── 一票否决检查 ──────────────────────────────────
+        # ── 一票否决检查 1：ping_pong_rate ──────────────────
         ppr = stage2_result.interaction_features.negotiation_ping_pong_rate
         if ppr > 0.1 and not is_decoupled:
             return {
@@ -1047,11 +1164,47 @@ class AdvancedVoicemailDetector:
             score += self._SCORE_DECOUPLED
             details.append(f"解耦盲说状态 (is_decoupled=True) → +{self._SCORE_DECOUPLED}")
 
-        # ── 最终判定 ──────────────────────────────────────
+        # ── 一票否决检查 2：跨轮次语义连贯度防线 ──────────
+        # 废除旧的字数比例防线，改用 TF-IDF 语义耦合检测
+        max_cross_turn_sim: float = 0.0
+        valid_turns = [
+            t for t in stage2_result.dialogue_turns
+            if not t.is_backchannel and t.merged_text.strip()
+        ]
+
+        for i in range(len(valid_turns) - 1):
+            turn_a = valid_turns[i]
+            turn_b = valid_turns[i + 1]
+            # 只计算相邻且角色不同的轮次
+            if turn_a.speaker_id == turn_b.speaker_id:
+                continue
+            sim = _tfidf_cosine_similarity(
+                turn_a.merged_text, turn_b.merged_text
+            )
+            if sim > max_cross_turn_sim:
+                max_cross_turn_sim = sim
+
         is_voicemail = score > self._VOICEMAIL_THRESHOLD
+
+        if is_voicemail and max_cross_turn_sim > self._CROSS_TURN_SIM_THRESHOLD:
+            # 语义防线一票否决：检测到跨角色语义高度耦合，推翻无效通话判定
+            veto_reason = (
+                f"触发连贯度防线：检测到跨角色语义高度耦合 "
+                f"(sim={max_cross_turn_sim:.4f} > {self._CROSS_TURN_SIM_THRESHOLD})，"
+                f"推翻单向盲播判定"
+            )
+            details.append(veto_reason)
+            return {
+                "voicemail_score": score,
+                "is_voicemail":    False,
+                "veto_reason":     veto_reason,
+                "details":         details,
+            }
+
         details.append(
-            f"最终得分={score}，阈值={self._VOICEMAIL_THRESHOLD}，"
-            f"判定={'无效通话' if is_voicemail else '有效通话'}"
+            f"跨轮次语义连贯度={max_cross_turn_sim:.4f}，"
+            f"阈值={self._CROSS_TURN_SIM_THRESHOLD}，"
+            f"最终得分={score}，判定={'无效通话' if is_voicemail else '有效通话'}"
         )
 
         return {
@@ -1059,6 +1212,7 @@ class AdvancedVoicemailDetector:
             "is_voicemail":  is_voicemail,
             "veto_reason":    None,
             "details":        details,
+            "cross_turn_sim": round(max_cross_turn_sim, 4),
         }
 
     @staticmethod
