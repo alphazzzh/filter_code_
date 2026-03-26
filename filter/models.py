@@ -79,6 +79,11 @@ class BotFeatures(BaseModel):
         default=None,
         description="全文 SimHash 值（可选，供批处理引擎碰撞检测使用）",
     )
+    total_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="文本总 Token 数（用于短文本保护，避免误判 BOT）",
+    )
 
     model_config = {"frozen": True}
 

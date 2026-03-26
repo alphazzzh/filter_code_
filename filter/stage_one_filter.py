@@ -125,14 +125,22 @@ class BotFeatureExtractor:
                 filler_word_ratio=filler_ratio,
                 prefix_tokens=text[:20],
                 simhash_value=simhash_val, # 👈 下游 Flink 可在 5 分钟滑动窗口中以此做碰撞拦截
+                total_tokens=total,         # 👈 保存总 Token 数，供 infer_bot_label 短文本保护使用
             )
+
+    # 短文本 Token 阈值：低于此值无法通过语气词可靠判定 BOT
+    _BOT_MIN_TOKENS: int = 30
 
     @staticmethod
     def infer_bot_label(features: BotFeatures) -> BotLabel:
         """
-        启发式判定：语气词占比极低 → 疑似机器人。
-        阈值来源于业务经验，可配置化。
+        启发式判定：仅在长对话中，语气词占比极低才疑似机器人。
+        短文本（< 30 Token）一律返回 UNCERTAIN，避免误杀口齿清晰的真人短对话。
         """
+        # 【Bug 2 修复】短文本保护：Token 数不足 30，无法可靠判定，一律给 UNCERTAIN
+        if features.total_tokens < BotFeatureExtractor._BOT_MIN_TOKENS:
+            return BotLabel.UNCERTAIN
+
         if features.filler_word_ratio < 0.02:
             return BotLabel.BOT
         elif features.filler_word_ratio > 0.05:

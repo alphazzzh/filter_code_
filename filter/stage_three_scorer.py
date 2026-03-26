@@ -361,13 +361,14 @@ class IntelligenceScorer:
                 if topic_id in all_intents:
                     # [原有逻辑保留]：抑制物流对毒品的误报
                     if topic_id == "corporate_logistics" and not nlp_feats.get("has_drug_quantity"):
-                        _events_to_remove = []
+                        # 【隐患 3 修复】使用列表推导重建，避免 list.remove(e) 在重复 dict 时删错项
+                        surviving_events = []
                         for e in ctx.events:
                             if e["tag"].startswith("has_drug_") or e["tag"].startswith("drug_quantity_"):
-                                ctx.score -= e["delta"]
-                                _events_to_remove.append(e)
-                        for e in _events_to_remove:
-                            ctx.events.remove(e)
+                                ctx.score -= e["delta"]  # 回退分数
+                            else:
+                                surviving_events.append(e)
+                        ctx.events = surviving_events
 
                     # Step A：永远先给予低价值单项基础扣分
                     if topic_def.scoring_rules.standalone_score != 0:
@@ -532,6 +533,9 @@ class IntelligenceScorer:
     # 输出组装
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+    # 高危兜底锁底线分：有高危加分事件时，绝不能跌破此分数
+    _HIGH_RISK_FLOOR: int = 60
+
     @staticmethod
     def _build_output(
         ctx:       _ScoringContext,
@@ -539,7 +543,16 @@ class IntelligenceScorer:
         nlp_feats: dict[str, Any],
     ) -> dict[str, Any]:
         """边界钳位 [0,100] + 结构化情报字典组装。"""
-        final_score = max(_SCORE_MIN, min(_SCORE_MAX, ctx.score))
+        # 【Bug 1 修复】高危兜底锁（Floor Clamp）
+        # 如果曾经命中过任何正向加分的高危标签（delta > 0 且非白名单豁免），
+        # 即使被受害者抵抗/豁免扣分，底线也是 60 分，保证不会落入垃圾填埋场
+        has_high_risk = any(
+            e["delta"] > 0 and not e["tag"].startswith("official")
+            for e in ctx.events
+        )
+        floor_score = IntelligenceScorer._HIGH_RISK_FLOOR if has_high_risk else _SCORE_MIN
+
+        final_score = max(floor_score, min(_SCORE_MAX, ctx.score))
 
         roles: dict[str, str] = {
             r.speaker_id: r.role.value for r in result.speaker_roles

@@ -156,49 +156,78 @@ async def analyze_conversation(req: AnalyzeRequest):
         extra_meta = {}
         if req.dynamic_topic:
             extra_meta["dynamic_topic"] = req.dynamic_topic
-            
-        stage2_result = pipeline_engine.process_conversation(
-            conversation_id=req.session_id,
-            records=valid_records,
-            extra_metadata=extra_meta
-        )
 
-        # ── Step 4: 阶段三 (打分器裁决) ──
-        final_result = scorer_engine.evaluate(stage2_result)
+        try:
+            stage2_result = pipeline_engine.process_conversation(
+                conversation_id=req.session_id,
+                records=valid_records,
+                extra_metadata=extra_meta
+            )
 
-        # ── Step 4.5: 多维置信度辅助判定 ──
-        # 计算 TopologyMetrics 供新引擎使用
-        topo_metrics = topology_engine.compute_metrics(stage2_result.dialogue_turns)
-        bot_result = bot_engine.evaluate(stage2_result, filler_word_rate=topo_metrics.filler_word_rate)
-        voicemail_result = voicemail_engine.evaluate(stage2_result, is_decoupled=topo_metrics.is_decoupled)
+            # ── Step 4: 阶段三 (打分器裁决) ──
+            final_result = scorer_engine.evaluate(stage2_result)
 
-        # 将辅助判定结果注入 final_result
-        final_result["bot_confidence"] = {
-            "bot_score": bot_result["bot_score"],
-            "bot_label": bot_result["bot_label"].value,
-            "veto_reason": bot_result["veto_reason"],
-            "details": bot_result["details"],
-        }
-        final_result["voicemail_detection"] = {
-            "voicemail_score": voicemail_result["voicemail_score"],
-            "is_voicemail": voicemail_result["is_voicemail"],
-            "veto_reason": voicemail_result["veto_reason"],
-            "details": voicemail_result["details"],
-        }
-        final_result["topology_metrics"] = {
-            "filler_word_rate": topo_metrics.filler_word_rate,
-            "max_sentence_length": topo_metrics.max_sentence_length,
-            "avg_sentence_length": topo_metrics.avg_sentence_length,
-            "is_decoupled": topo_metrics.is_decoupled,
-        }
+            # ── Step 4.5: 多维置信度辅助判定 ──
+            # 计算 TopologyMetrics 供新引擎使用
+            topo_metrics = topology_engine.compute_metrics(stage2_result.dialogue_turns)
+            bot_result = bot_engine.evaluate(stage2_result, filler_word_rate=topo_metrics.filler_word_rate)
+            voicemail_result = voicemail_engine.evaluate(stage2_result, is_decoupled=topo_metrics.is_decoupled)
 
-        # ── Step 5: 组装标准出参 ──
-        return StandardResponse(
-            status=200,                  # 👈 成功状态
-            message="OK",                # 👈 成功信息
-            session_id=req.session_id,
-            data=final_result            # 👈 核心产出结果
-        )
+            # 将辅助判定结果注入 final_result
+            final_result["bot_confidence"] = {
+                "bot_score": bot_result["bot_score"],
+                "bot_label": bot_result["bot_label"].value,
+                "veto_reason": bot_result["veto_reason"],
+                "details": bot_result["details"],
+            }
+            final_result["voicemail_detection"] = {
+                "voicemail_score": voicemail_result["voicemail_score"],
+                "is_voicemail": voicemail_result["is_voicemail"],
+                "veto_reason": voicemail_result["veto_reason"],
+                "details": voicemail_result["details"],
+            }
+            final_result["topology_metrics"] = {
+                "filler_word_rate": topo_metrics.filler_word_rate,
+                "max_sentence_length": topo_metrics.max_sentence_length,
+                "avg_sentence_length": topo_metrics.avg_sentence_length,
+                "is_decoupled": topo_metrics.is_decoupled,
+            }
+
+            # ── Step 5: 组装标准出参 ──
+            return StandardResponse(
+                status=200,                  # 👈 成功状态
+                message="OK",                # 👈 成功信息
+                session_id=req.session_id,
+                data=final_result            # 👈 核心产出结果
+            )
+
+        except Exception as stage_exc:
+            # 【隐患 4 修复】阶段二/三模型推理阶段崩溃，降级返回 206 Partial Content
+            # 上游监控系统可通过 HTTP 206 发现 GPU 显存爆了 / BGE 模型加载失败等问题
+            logger.error(
+                f"[Stage2/3] session_id={req.session_id} 模型推理阶段失败，降级输出: {stage_exc}",
+                exc_info=True,
+            )
+            # 构建 fallback 最小化结果（仅基于阶段一特征）
+            fallback_result = {
+                "conversation_id": req.session_id,
+                "final_score": 5,
+                "tags": ["stage2_3_degraded"],
+                "track_type": "n/a",
+                "roles": {},
+                "interaction_summary": {},
+                "score_breakdown": [{"delta": -45, "reason": "阶段二/三推理失败，降级为阶段一最小化输出"}],
+                "_degradation_error": f"Stage2/3 Process Error: {str(stage_exc)}",
+            }
+            return JSONResponse(
+                status_code=206,
+                content={
+                    "status": 206,
+                    "message": "Partial Content: Stage2/3 inference failed, degraded to Stage1 output",
+                    "session_id": req.session_id,
+                    "data": fallback_result,
+                }
+            )
 
     except Exception as e:
         logger.error(f"处理 session_id: {req.session_id} 发生致命错误: {str(e)}", exc_info=True)
