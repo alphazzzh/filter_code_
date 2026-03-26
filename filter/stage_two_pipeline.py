@@ -261,7 +261,11 @@ class SyntaxFeatureExtractor:
 
         # 判断是否有需要 NLP 解析的规则（避免对仅正则的短文本调用重量级模型）
         needs_nlp = any(
-            r.rule_type in (SyntaxRuleType.NER_DENSITY, SyntaxRuleType.IMPERATIVE_SYNTAX)
+            r.rule_type in (
+                SyntaxRuleType.NER_DENSITY,
+                SyntaxRuleType.IMPERATIVE_SYNTAX,
+                SyntaxRuleType.VERB_ENTITY_SPARSITY,  # 业务实体稀疏度探针也依赖 NER 解析
+            )
             for r in self._rules.values()
         )
         parsed: dict[str, Any] = self._backend.analyze(text) if needs_nlp else {}

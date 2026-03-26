@@ -157,14 +157,19 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
         
         # ── Step 1: 解析 ──
         raw_turns = req.data.content
-        records = [
-            ASRRecord(
-                record_id=str(turn if isinstance(turn, dict) else turn.dict().get("id", "")),
-                speaker_id=str(turn if isinstance(turn, dict) else turn.dict().get("speaker", "")),
-                raw_text=str(turn if isinstance(turn, dict) else turn.dict().get("content", ""))
-            )
-            for turn in raw_turns
-        ]
+        records = []
+        for turn in raw_turns:
+            if isinstance(turn, dict):
+                r_id  = str(turn.get("id", ""))
+                r_spk = str(turn.get("speaker", ""))
+                r_txt = str(turn.get("content", ""))
+            else:
+                # 兼容 Pydantic Model (V1 dict() / V2 model_dump())
+                r_id  = str(getattr(turn, "id", ""))
+                r_spk = str(getattr(turn, "speaker", ""))
+                r_txt = str(getattr(turn, "content", ""))
+                
+            records.append(ASRRecord(record_id=r_id, speaker_id=r_spk, raw_text=r_txt))
         if not records:
             response.status_code = status.HTTP_400_BAD_REQUEST
             return StandardResponse(status=400, message="Content array is empty", session_id=req.session_id)
