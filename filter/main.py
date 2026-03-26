@@ -21,12 +21,11 @@
 #
 # 工业级流转建议（详见 _route_record 的注释）
 # ─────────────────────────────────────────────────────────────
-# 不同于简单地"过滤掉未接通就丢弃"，我们采用分流策略：
+# V5.0 重构：铲除 LITE 分流，采用 PASS / SKIP 二态策略：
 #   PASS   → 正常接通记录，走完全部五个阶段
-#   LITE   → 未接通/机器人，仅写入阶段一特征 + score=0~10 的最小化结果
-#   SKIP   → 极端噪声（空文本/系统噪音），直接丢弃，写日志
-# 这样下游情报系统能看到完整的漏斗数据，而不是只收到接通记录，
-# 方便统计 bot 识别率、未接通率等运营指标。
+#   SKIP   → 极端噪声（空文本/纯噪音字符），直接丢弃，写日志
+# UnconnectedDetector 已从 StageOneFilter 中铲除，
+# 所有记录均标记为 CONNECTED，由后续拓扑引擎和打分器全权判定价值。
 # ============================================================
 
 from __future__ import annotations
@@ -87,8 +86,7 @@ class PipelineConfig:
     bge_model_name:  str = "BAAI/bge-m3"
     use_fp16:        bool = True
     intent_threshold:float = 0.75
-    # 漏斗路由：未接通的记录是否进入阶段二（False=仅写最小化结果）
-    route_lite_to_stage2: bool = False
+    # 漏斗路由：纯噪音记录直接丢弃
     # 控制台预览：每处理多少条打印一次摘要
     preview_every:   int  = 50
 
@@ -98,44 +96,26 @@ class PipelineConfig:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class RouteDecision:
-    PASS = "PASS"    # 正常接通，走全链路
-    LITE = "LITE"    # 未接通/Bot，最小化处理后写出
+    PASS = "PASS"    # 正常放行，走全链路
     SKIP = "SKIP"    # 极端噪声，丢弃
 
 
-def _route_record(record: ASRRecord) -> str:
+def _route_record(records: list[ASRRecord]) -> str:
     """
-    根据阶段一特征决定记录的流转路径。
+    根据阶段一产出决定记录的流转路径。
 
-    工业级流转建议
-    ──────────────────────────────────────────────────────────
-    ① SKIP：text 为空或极端乱码，对任何下游系统都没有价值。
-       条件：effective_text 长度 < 1 个字符。
-
-    ② LITE：阶段一已判定为未接通或机器人。
-       此类记录不需要昂贵的 BGE-M3 推理，但仍需写入结果文件，
-       原因：
-       - 未接通/Bot 的统计比例本身就是情报（可识别攻击波次）。
-       - 下游漏斗分析需要完整分母，而不是只收到接通记录。
-       写出内容：conversation_id + final_score(≤10) + tags。
-
-    ③ PASS：其余所有记录，无论 p_unconnected 多高，都走全链路。
-       打分器阶段三会再次用 p_unconnected 扣分，不会遗漏惩罚。
-       这样做的好处：即使是边界灰区记录也有完整特征，
-       情报人员可以手动审核证据链。
+    V5.0 重构：铲除 V1.0 的 p_unconnected / LITE 分流逻辑。
+    改为基于全量 effective_text 拼接后的去重长度判断：
+      SKIP：拼接去重后总长度 < 5，纯噪音（如"嗯"、"喂"等单字）
+      PASS：其余一律放行，保留语气词供拓扑引擎分析
     """
-    text = record.effective_text
-    if not text:
+    # 拼接所有记录的有效文本并去重
+    all_text = " ".join(r.effective_text for r in records if r.effective_text)
+    unique_chars = set(all_text.replace(" ", ""))
+    
+    if len(unique_chars) < 5:
         return RouteDecision.SKIP
-
-    # 从阶段一填充的 metadata 中读取信号
-    meta        = getattr(record, "metadata", {})
-    s1          = meta.get("stage_one", {}) if isinstance(meta, dict) else {}
-    p_unc:float = float(s1.get("p_unconnected", 0.0))
-
-    if p_unc > 0.8:
-        return RouteDecision.LITE
-
+    
     return RouteDecision.PASS
 
 
@@ -288,38 +268,8 @@ def _iter_mock_conversations() -> Iterator[tuple[str, list[ASRRecord]]]:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LITE 路径：最小化结果组装（未接通/Bot）
+# SKIP 路径：占位结果（极端噪声）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _build_lite_result(
-    conv_id: str,
-    records: list[ASRRecord],
-) -> dict[str, Any]:
-    """
-    为 LITE 路径（未接通/Bot）构建最小化情报记录。
-    不调用阶段二，避免 BGE-M3 推理开销。
-    final_score 固定为 5（标志性低分，方便下游过滤）。
-    """
-    # 从第一条 record 的 metadata 中提取阶段一特征
-    first_meta = getattr(records[0], "metadata", {}) if records else {}
-    s1         = first_meta.get("stage_one", {}) if isinstance(first_meta, dict) else {}
-
-    tags: list[str] = []
-    if float(s1.get("p_unconnected", 0.0)) > 0.8:
-        tags.append("unconnected_or_voicemail")
-    if str(s1.get("bot_label", "")).lower() == "bot":
-        tags.append("bot_caller")
-
-    return {
-        "conversation_id":     conv_id,
-        "final_score":         5,
-        "tags":                sorted(tags),
-        "track_type":          "n/a",
-        "roles":               {},
-        "interaction_summary": {},
-        "score_breakdown":     [{"delta": -45, "reason": "LITE 路径：未接通或机器人，最小化输出"}],
-        "_route":              "LITE",
-    }
 
 def _build_skip_result(conv_id: str) -> dict[str, Any]:
     """为 SKIP 路径（极端噪声）构建占位结果，确保漏斗数据完整。"""
@@ -381,7 +331,6 @@ def run_pipeline(config: PipelineConfig) -> None:
         "total_conversations": 0,
         "total_records":       0,
         "routed_pass":         0,
-        "routed_lite":         0,
         "routed_skip":         0,
         "stage2_processed":    0,
         "high_risk":           0,   # final_score >= 70
@@ -421,8 +370,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                 continue
 
             # ── 路由决策：基于阶段一产出 ─────────────────────
-            # 取会话中第一条有效记录的路由决策（以代表整通对话）
-            route: str = _route_record(s1_records[0])
+            route: str = _route_record(s1_records)
 
             if route == RouteDecision.SKIP:
                 stats["routed_skip"] += 1
@@ -433,24 +381,12 @@ def run_pipeline(config: PipelineConfig) -> None:
                 continue
 
             # 阶段一 metadata 透传：将汇总的阶段一信号注入给阶段二 extra_metadata
-            # 这样 StageTwoResult.metadata["stage_one"] 就可以被 Scorer 读取
             s1_aggregate_meta: dict[str, Any] = _aggregate_stage1_meta(s1_records)
             
             # 🚨 缺陷 1 修复：阶段一硬正则极高危透传
             if has_immunity:
                 s1_aggregate_meta["stage_one_critical_hit"] = True
                 s1_aggregate_meta["hit_keyword"] = "高危免疫特征"
-
-            if route == RouteDecision.LITE:
-                stats["routed_lite"] += 1
-                # LITE 路径：写最小化结果，不调用阶段二
-                lite_result = _build_lite_result(conv_id, s1_records)
-                lite_result["_processed_at"] = datetime.utcnow().isoformat()
-                _write_json_line(out_f, lite_result)
-
-                if stats["total_conversations"] % config.preview_every == 0:
-                    _print_preview(lite_result)
-                continue
 
             # ── PASS 路径：阶段二 + 打分 ─────────────────────
             stats["routed_pass"] += 1
@@ -522,30 +458,18 @@ def _aggregate_stage1_meta(records: list[ASRRecord]) -> dict[str, Any]:
     """
     将一组 ASRRecord 的阶段一元信息聚合为会话级别的单一字典。
 
-    聚合策略
-    ──────────────────────────────────────────────────────────
-    - p_unconnected : 取会话内所有记录的最大值（最危险的为准）
-    - bot_label     : 若任一记录为 bot，则整通对话标记为 bot
-    - entity_matched: 任一记录命中业务实体，则整通对话命中
+    V5.0 重构：移除 p_unconnected / entity_matched（UnconnectedDetector 已铲除），
+    仅保留 bot_label 和 dominant_lang。
     """
-    max_p_unc:    float = 0.0
     any_bot:      bool  = False
-    any_entity:   bool  = False
     lang_counter: dict[str, int] = {}
 
     for rec in records:
         meta = getattr(rec, "metadata", {})
         s1   = meta.get("stage_one", {}) if isinstance(meta, dict) else {}
 
-        p = float(s1.get("p_unconnected", 0.0))
-        if p > max_p_unc:
-            max_p_unc = p
-
         if str(s1.get("bot_label", "")).lower() == "bot":
             any_bot = True
-
-        if s1.get("entity_matched", False):
-            any_entity = True
 
         lang = getattr(rec, "lang", None) or "zh"
         lang_counter[lang] = lang_counter.get(lang, 0) + 1
@@ -555,9 +479,7 @@ def _aggregate_stage1_meta(records: list[ASRRecord]) -> dict[str, Any]:
         if lang_counter else "zh"
 
     return {
-        "p_unconnected":  max_p_unc,
         "bot_label":      "bot" if any_bot else "human",
-        "entity_matched": any_entity,
         "dominant_lang":  dominant_lang,
     }
 
@@ -586,7 +508,6 @@ def _print_funnel_summary(stats: dict[str, int]) -> None:
     logger.info(f"  总对话数    : {stats['total_conversations']}")
     logger.info(f"  总 ASR 碎片 : {stats['total_records']}")
     logger.info(f"  路由 PASS   : {stats['routed_pass']}")
-    logger.info(f"  路由 LITE   : {stats['routed_lite']}")
     logger.info(f"  路由 SKIP   : {stats['routed_skip']}")
     logger.info(f"  阶段二完成  : {stats['stage2_processed']}")
     logger.info(f"  高风险(≥70) : {stats['high_risk']}")
@@ -662,12 +583,11 @@ if __name__ == "__main__":
     # 此处使用 dataclass 默认值快速启动
     cfg = PipelineConfig(
         input_csv     = "data/asr_records.csv",   # 不存在时自动切换 Mock 数据
-        output_jsonl  = "output/intelligence_results.jsonl",
-        fasttext_model= "models/lid.176.bin",
-        bge_model_name= "BAAI/bge-m3",
+        output_jsonl  = "/home/zzh/923/output/intelligence_results.jsonl",
+        fasttext_model= "/home/zzh/923/model/lid.176.bin",
+        bge_model_name= "/home/zzh/923/model/dir",
         use_fp16      = False,   # 无 GPU 时设为 False
         intent_threshold = 0.75,
-        route_lite_to_stage2 = False,
         preview_every = 1,       # 演示时每条都预览
     )
     run_pipeline(cfg)

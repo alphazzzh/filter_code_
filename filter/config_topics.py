@@ -550,6 +550,43 @@ _TOPIC_COERCIVE_ORG_CONTROL = TopicDefinition(
 
 
 # ─────────────────────────────────────────────────────────────
+# HIGH_RISK 主题 3.5：极端思想与邪教传播
+# ─────────────────────────────────────────────────────────────
+# 设计说明：
+# 锚点词库聚焦已知邪教组织标识性用语与极端末世论传播话术。
+# 无需强依赖硬特征矩阵，只要命中即触发强预警（standalone_score=40）。
+
+_TOPIC_EXTREMIST_PROPAGANDA = TopicDefinition(
+    topic_id    = "extremist_propaganda",
+    category    = TopicCategory.HIGH_RISK,
+    description = "极端思想与邪教传播：已知邪教组织标识性用语、末世论、度人话术等",
+    threshold   = 0.70,
+    bge_anchors = [
+        # 标识性称谓/仪式
+        "奉父神",
+        "侯立军",
+        "圣名",
+        "全能神",
+        # 末世论/惩罚论
+        "审判魔鬼",
+        "神的惩罚",
+        "世界末日",
+        # 传播话术
+        "度人",
+        "法轮功",
+    ],
+    syntax_rules = [],
+    scoring_rules = ScoringRules(
+        standalone_score = 40,
+        standalone_tag   = "extremist_propaganda",
+        matrix_combinations = [
+            MatrixCombination("high_entity_density", 10, "extremist_with_dense_entities"),
+        ],
+    ),
+)
+
+
+# ─────────────────────────────────────────────────────────────
 # HIGH_RISK 主题 4：有组织广播行为
 # ─────────────────────────────────────────────────────────────
 
@@ -1485,6 +1522,24 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
         "银保监会备案",
         "第三方支付清算",
         "资金清算通道",
+        # ── 英文/日文 BGE 跨语言诈骗起手式（BGE-M3 原生匹配）──
+        # 英文电商客服诈骗
+        "Amazon customer service",
+        "cancel your subscription",
+        "account will be suspended",
+        "your account has been compromised",
+        "unauthorized transaction on your card",
+        "verify your identity immediately",
+        "suspicious activity detected",
+        "Apple support billing department",
+        "your membership will be charged",
+        "press 1 to speak with an agent",
+        "your payment method has expired",
+        "we noticed unusual login activity",
+        # 日文伪装客服诈骗（オレオレ詐欺/フィッシング）
+        "自動課金", "未納料金", "確認コード",
+        "アカウントが凍結されました", "緊急のお知らせ",
+        "支払いが確認できません", "あなたの口座に不正アクセス",
     ],
     scoring_rules = ScoringRules(
         standalone_score = 15,
@@ -2074,21 +2129,28 @@ _TOPIC_GLOBAL_SYNTAX_REGISTRY = TopicDefinition(
 # 用于 BotConfidenceEngine 的一票否决机制：
 # 命中此词库的对话强制标记为 HUMAN（真人才会骂人/激烈反抗）
 PROFANITY_REGISTRY: list[str] = [
-    # 脏话/侮辱
+    # ── 中文脏话/侮辱 ──
     "你有病", "神经病", "脑残", "智障", "傻逼", "脑子有坑",
     "滚", "滚蛋", "去死", "死全家", "你妈的", "操你",
     "王八蛋", "混蛋", "人渣", "废物", "垃圾",
-    "买腰子", "卖腰子",
-    # 攻击性/威胁
+    "买腰子", "卖腰子", "屌",
+    # ── 攻击性/威胁 ──
     "报警", "起诉我", "告你", "投诉你", "举报你",
     "骗子", "诈骗", "你是骗子", "死骗子",
-    # 激烈反驳
+    # ── 激烈反驳 ──
     "证明给我看", "你证明一下", "拿证据来", "有证据吗",
     "少来", "少废话", "别废话", "放屁", "扯淡", "胡说八道",
     "闭嘴", "烦死了", "你有完没完",
-    # 英文脏话
-    "fuck you", "bullshit", "shut up", "go to hell",
-    "you're a scammer", "scam", "fraud",
+    # ── 英文脏话/攻击 ──
+    "fuck", "fuck you", "bullshit", "shut up", "go to hell",
+    "bitch", "you're a scammer", "scam", "fraud",
+    "asshole", "crap", "damn it", "screw you",
+    # ── 日文脏话/攻击 ──
+    "バカ", "ふざけるな", "くそ", "詐欺", "死ね", "うざい", "きしょい",
+    # ── 粤语脏话 ──
+    "仆街", "冚家剷", "撚", "閪", "丢你老母", "傻嗨", "仆街啦",
+    # ── 韩语脏话/攻击 ──
+    "병신", "개새끼", "씨발", "존나",
 ]
 
 
@@ -2107,6 +2169,7 @@ TOPIC_REGISTRY: dict[str, TopicDefinition] = {
     "drug_jargon":            _TOPIC_DRUG_JARGON,
     "drug_chain":             _TOPIC_DRUG_CHAIN,
     "coercive_org_control":   _TOPIC_COERCIVE_ORG_CONTROL,
+    "extremist_propaganda":   _TOPIC_EXTREMIST_PROPAGANDA,
     "coordinated_broadcast":  _TOPIC_COORDINATED_BROADCAST,
     "incitement_to_violence": _TOPIC_INCITEMENT_TO_VIOLENCE,
     "e_commerce_cs":          _TOPIC_E_COMMERCE_CS,

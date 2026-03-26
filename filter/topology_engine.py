@@ -31,10 +31,23 @@ _BACKCHANNEL_WORDS: frozenset[str] = frozenset([
     "ok", "okay", "yeah", "yep", "uh-huh", "mhm",
 ])
 
-# 语气词集合（用于 filler_word_rate 计算）
-_FILLER_WORDS: frozenset[str] = frozenset(
-    "嗯啊哦呢那个嘛呀哈哟喔唔嘿吧诶哇哦哦哦嗯嗯嗯啊啊啊"
-)
+# 语气词集合（用于 filler_word_rate 计算）—— 多语言支持：中/英/日/粤/韩
+_FILLER_WORDS: frozenset[str] = frozenset({
+    # ── 中文语气词 ──
+    "嗯", "啊", "那个", "就是说", "哎", "噢", "呀", "呢", "嘛",
+    "哦", "哈", "哎哟", "唔", "嘿", "噢", "哦哦", "哈哈", "唉",
+    # ── 粤语语气词 ──
+    "咁", "即係", "誒", "唔", "呢", "咗", "嘅", "噃", "囉", "喇",
+    # ── 英文语气词 ──
+    "um", "uh", "well", "like", "you know", "hmm", "er", "ah",
+    "oh", "okay", "ok", "yeah", "yep", "right", "I mean",
+    "so", "basically", "actually", "literally", "sort of", "kind of",
+    # ── 日文语气词 ──
+    "ええと", "あの", "まぁ", "なんか", "うーん", "えっと",
+    "そうですね", "あー", "えー", "いや", "うん", "その",
+    # ── 韩语语气词（韩文 + 罗马音）──
+    "음", "어", "그러니까", "저기요", "아", "막상막하",
+})
 
 # 指令性关键词（用于 is_decoupled 解耦盲说判定）
 _DIRECTIVE_KEYWORDS: frozenset[str] = frozenset([
@@ -363,28 +376,50 @@ class TopologyEngine:
     @staticmethod
     def _compute_filler_word_rate(turns: list[DialogueTurn]) -> float:
         """
-        计算语气词（嗯/啊/那个/呢 等）占总字数的比例。
+        计算语气词占总词数的比例（多语言：中/英/日/粤）。
+
+        算法：将轮次文本转为小写后，使用子串匹配检测 FILLER_WORDS 中的
+        多字节语气词（如"ええと"、"you know"），同时保留单字符级别匹配。
 
         机器人外呼通常极度流畅（filler_word_rate < 0.005），
         真人对话通常 > 0.02。
         """
-        total_chars: int = 0
-        filler_chars: int = 0
+        total_words: int = 0
+        filler_hits: int = 0
 
         for turn in turns:
             if turn.is_backchannel:
                 continue
             text = turn.merged_text
-            for ch in text:
-                if ch.isspace():
-                    continue
-                total_chars += 1
-                if ch in _FILLER_WORDS:
-                    filler_chars += 1
+            total_words += _count_words(text)
 
-        if total_chars == 0:
+            # 先检测多字节语气词（长词优先匹配，避免子串误命中）
+            text_lower = text.lower()
+            matched_positions: set[int] = set()  # 已匹配的字符位置
+            # 按长度降序排列，确保长词优先
+            sorted_fillers = sorted(_FILLER_WORDS, key=len, reverse=True)
+            for filler in sorted_fillers:
+                filler_lower = filler.lower()
+                start = 0
+                while True:
+                    idx = text_lower.find(filler_lower, start)
+                    if idx == -1:
+                        break
+                    # 标记已匹配的位置
+                    for pos in range(idx, idx + len(filler)):
+                        matched_positions.add(pos)
+                    filler_hits += 1
+                    start = idx + len(filler)
+
+            # 单字符级别语气词检测（仅对未被多字节匹配的字符）
+            for i, ch in enumerate(text):
+                if not ch.isspace() and i not in matched_positions and ch.lower() in "嗯啊哦呢呀哈哟喔唔嘿吧诶"
+                    # 单字符语气词贡献 0.5（因为一个中文字通常 = 1 词但语气价值较低）
+                    filler_hits += 0.5
+
+        if total_words == 0:
             return 0.0
-        return round(filler_chars / total_chars, 6)
+        return round(filler_hits / total_words, 6)
 
     # ── 单句最大字数 ────────────────────────────────────────
 

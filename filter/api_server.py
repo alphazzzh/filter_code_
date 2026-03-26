@@ -6,6 +6,7 @@
 import asyncio
 import json
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
@@ -20,7 +21,14 @@ from models import ASRRecord, ConnectionStatus, BotLabel
 from stage_one_filter import StageOneFilter
 from stage_two_pipeline import StageTwoPipeline
 from stage_three_scorer import IntelligenceScorer, BotConfidenceEngine, AdvancedVoicemailDetector
-from topology_engine import TopologyEngine
+from topology_engine import TopologyEngine, TopologyAnalyzer
+
+# 多语言引擎（可选依赖，加载失败不阻塞启动）
+try:
+    import fasttext
+    _FASTTEXT_AVAILABLE = True
+except ImportError:
+    _FASTTEXT_AVAILABLE = False
 
 # CUDA 显存管理（可选依赖，无 torch 时不影响服务启动）
 try:
@@ -44,6 +52,7 @@ class EngineState:
     bot_engine: BotConfidenceEngine
     voicemail_engine: AdvancedVoicemailDetector
     topo_engine: TopologyEngine
+    lid_model: Any | None = None  # fasttext 语种识别模型（可选）
     
     # 并发控制器
     cpu_pool: ThreadPoolExecutor
@@ -79,13 +88,34 @@ async def lifespan(app: FastAPI):
     # 过载保护计数器的异步锁（必须在 event loop 内创建）
     state._request_lock = asyncio.Lock()
 
+    # 从环境变量读取模型路径（适配微服务 / Docker 部署）
+    bge_path = os.getenv("MODEL_BGE_PATH", "BAAI/bge-m3")
+    ltp_path = os.getenv("MODEL_LTP_PATH", "LTP/small")
+    logger.info(f"模型路径配置: BGE={bge_path}, LTP={ltp_path}")
+
     # 实例化所有引擎（加载 BGE 模型、LTP 模型等）
     state.stage1 = StageOneFilter()
-    state.stage2 = StageTwoPipeline()
+    state.stage2 = StageTwoPipeline(
+        bge_model_name=bge_path,
+        ltp_model_path=ltp_path,
+    )
     state.scorer = IntelligenceScorer()
     state.bot_engine = BotConfidenceEngine()
     state.voicemail_engine = AdvancedVoicemailDetector()
     state.topo_engine = TopologyEngine()
+
+    # 加载 LID 语种识别模型（可选依赖）
+    if _FASTTEXT_AVAILABLE:
+        lid_path = os.getenv("MODEL_LID_PATH", "models/lid.176.bin")
+        try:
+            state.lid_model = fasttext.load_model(lid_path)
+            logger.info(f"✅ LID 语种识别模型加载成功: {lid_path}")
+        except Exception as lid_err:
+            logger.warning(f"⚠️ LID 模型加载失败（不影响核心功能）: {lid_err}")
+            state.lid_model = None
+    else:
+        logger.info("ℹ️ fasttext 未安装，跳过 LID 语种识别")
+
     logger.info("✅ ML 引擎加载完毕，API 准备就绪。")
     
     yield # 运行中...
@@ -187,15 +217,40 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
         s1_func = partial(state.stage1.process_batch, records)
         s1_records = await loop.run_in_executor(state.cpu_pool, s1_func)
         
-        valid_records = [r for r in s1_records if r.connection_status != ConnectionStatus.UNCONNECTED]
-        if not valid_records:
-            return StandardResponse(
-                status=200, message="OK", session_id=req.session_id,
-                data={"final_score": 5, "tags": ["stage_one_physical_interception"], "reason": "极低价值废料拦截"}
+        # 直接放行所有阶段一产出，保留语气词供后续拓扑引擎分析
+        valid_records = s1_records
+
+        # ── Step 2.5: 拓扑分析 + LID 语种打标（纯 CPU，线程池执行）──
+        topo_analyzer = TopologyAnalyzer()
+        turns = topo_analyzer.merge_turns(valid_records)
+        topo_metrics = state.topo_engine.compute_metrics(turns)
+
+        # LID 语种识别（打标用，不做翻译，利用 BGE-M3 原生多语言能力）
+        nlp_features_extra: dict[str, Any] = {}
+        if state.lid_model is not None:
+            effective_text = " ".join(
+                rec.effective_text for rec in valid_records if rec.effective_text
             )
+            if effective_text.strip():
+                try:
+                    lid_predictions, lid_confidences = state.lid_model.predict(effective_text.replace("\n", " "))
+                    detected_lang = lid_predictions[0].replace("__label__", "")
+                    confidence = lid_confidences[0]
+                    nlp_features_extra["detected_language"] = detected_lang
+                    nlp_features_extra["lid_confidence"] = round(float(confidence), 4)
+                    logger.info(f"[{req.session_id}] LID 检测语种: {detected_lang} (置信度: {confidence:.4f})")
+                except Exception as lid_err:
+                    logger.warning(f"[{req.session_id}] LID 预测失败: {lid_err}")
+                    nlp_features_extra["detected_language"] = "unknown"
+            else:
+                nlp_features_extra["detected_language"] = "empty"
+        else:
+            nlp_features_extra["detected_language"] = "unavailable"
 
         # ── Step 3: 阶段二 (GPU 计算密集，使用 Semaphore 排队 + 超时熔断) ──
+        # 将 nlp_features_extra 注入 extra_metadata，随 stage2 结果流到 scorer
         extra_meta = {"dynamic_topic": req.dynamic_topic} if req.dynamic_topic else {}
+        extra_meta["nlp_features_extra"] = nlp_features_extra
         stage2_func = partial(
             state.stage2.process_conversation,
             conversation_id=req.session_id,
@@ -241,15 +296,24 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
 
         # ── Step 4: 阶段三打分与拓扑 (纯 CPU 极快计算，继续卸载) ──
         def _run_scoring_sync():
+            # 将 LID 打标结果合并入 stage2_result 的 interaction_features
+            if nlp_features_extra:
+                stage2_result.metadata["nlp_features_extra"] = nlp_features_extra
+
             final_result = state.scorer.evaluate(stage2_result)
-            topo_metrics = state.topo_engine.compute_metrics(stage2_result.dialogue_turns)
+            # 复用 Step 2.5 已计算的 topo_metrics，避免重复计算
             bot_res = state.bot_engine.evaluate(stage2_result, filler_word_rate=topo_metrics.filler_word_rate)
             vm_res = state.voicemail_engine.evaluate(stage2_result, is_decoupled=topo_metrics.is_decoupled)
             
             final_result.update({
                 "bot_confidence": {"bot_score": bot_res["bot_score"], "bot_label": bot_res["bot_label"].value},
                 "voicemail_detection": {"voicemail_score": vm_res["voicemail_score"], "is_voicemail": vm_res["is_voicemail"]},
-                "topology_metrics": {"is_decoupled": topo_metrics.is_decoupled}
+                "topology_metrics": {
+                    "is_decoupled": topo_metrics.is_decoupled,
+                    "filler_word_rate": topo_metrics.filler_word_rate,
+                },
+                # 透传 LID 检测结果
+                "language_detection": nlp_features_extra,
             })
             return final_result
 

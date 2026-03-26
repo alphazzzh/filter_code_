@@ -486,7 +486,7 @@ class StageOneFilter:
     ─────────────────────────────────────────────────────────
     动作 1：Normalizer         → 填充 normalized_text
     动作 2：BotFeatureExtractor → 填充 bot_features / bot_label
-    动作 2：UnconnectedDetector → 填充 unconnected_features / connection_status
+    动作 2b：强制 CONNECTED 放行  → connection_status = CONNECTED
     动作 3：LIDRouter           → 填充 lang / lang_confidence
     动作 4：ASRErrorCorrector   → 填充 cleaned_text
     ─────────────────────────────────────────────────────────
@@ -506,9 +506,7 @@ class StageOneFilter:
         self._bot_extractor = BotFeatureExtractor(
             filler_words=filler_words or _FILLER_WORDS
         )
-        self._unconnected   = UnconnectedDetector(
-            entity_keywords=entity_keywords
-        )
+        # V1.0 UnconnectedDetector 已铲除：单句级熵值检测在多轮次 V5.0 下误判率过高
         self._lid_router    = LIDRouter(model_path=fasttext_model_path)
         self._corrector     = ASRErrorCorrector()
 
@@ -544,10 +542,9 @@ class StageOneFilter:
         record.bot_features = self._bot_extractor.extract(working_text)
         record.bot_label    = self._bot_extractor.infer_bot_label(record.bot_features)
 
-        # ── 动作 2b：未接通概率计算 ────────────────────────────
-        features, status = self._unconnected.compute(working_text)
-        record.unconnected_features = features
-        record.connection_status    = status
+        # ── 动作 2b：强制放行（V1.0 UnconnectedDetector 已铲除）──
+        record.unconnected_features = None
+        record.connection_status    = ConnectionStatus.CONNECTED
 
         # ── 动作 3：语种识别 ───────────────────────────────────
         lang, confidence = self._lid_router.detect(working_text)
@@ -562,8 +559,6 @@ class StageOneFilter:
 
         # ── 追加 metadata 调试信息 ─────────────────────────────
         record.metadata["stage_one"] = {
-            "entity_matched": features.f_entity == 0.0,
-            "p_unconnected":  features.p_unconnected,
             "lang_fallback":  confidence is None,
         }
 

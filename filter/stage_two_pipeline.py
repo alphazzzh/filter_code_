@@ -146,8 +146,11 @@ class _NlpBackend:
 class _LtpBackend(_NlpBackend):
     """LTP 4.x 后端，标签：HED/SBV/ADV/VOB。"""
 
-    def __init__(self, model_path: str = "LTP/small") -> None:
+    def __init__(self, model_path: str = "/home/zzh/923/model/ltp_small") -> None:
         from ltp import LTP  # type: ignore
+        import os
+        if not os.path.isdir(model_path):
+            raise FileNotFoundError(f"[LTP] 本地模型文件夹不存在: {model_path}")
         self._ltp = LTP(model_path)
 
     @property
@@ -157,13 +160,45 @@ class _LtpBackend(_NlpBackend):
     def analyze(self, text: str) -> dict[str, Any]:
         output = self._ltp.pipeline([text], tasks=["cws", "dep", "ner"])
         tokens: list[str] = output.cws[0] if output.cws else []
-        dep: list[tuple[int, str]] = [
-            (d["head"] - 1, d["label"].upper())
-            for d in (output.dep[0] if output.dep else [])
-        ]
-        ner: list[tuple[str, str]] = [
-            (s[0], s[1]) for s in (output.ner[0] if output.ner else [])
-        ]
+        
+        # ==========================================================
+        # 1. 鲁棒兼容处理依存句法 (dep)
+        # ==========================================================
+        dep: list[tuple[int, str]] = []
+        if output.dep:
+            dep_data = output.dep[0]
+            if isinstance(dep_data, dict):
+                # 新版 LTP 格式: {'head': [2, 0], 'label': ['SBV', 'HED']}
+                heads = dep_data.get("head", [])
+                labels = dep_data.get("label", [])
+                for h, l in zip(heads, labels):
+                    dep.append((h - 1, l.upper()))
+            elif isinstance(dep_data, list):
+                # 旧版 LTP 格式: [{'head': 2, 'label': 'SBV'}, ...]
+                for d in dep_data:
+                    if isinstance(d, dict):
+                        dep.append((d.get("head", 1) - 1, d.get("label", "UNK").upper()))
+        
+        # ==========================================================
+        # 2. 鲁棒兼容处理命名实体识别 (ner) (修复幽灵 Bug)
+        # ==========================================================
+        ner: list[tuple[str, str]] = []
+        if output.ner:
+            ner_data = output.ner[0]
+            if isinstance(ner_data, dict):
+                # 新版 LTP 格式: {'label': ['Nh'], 'text': ['张三'], 'offset': [...]}
+                labels = ner_data.get("label", [])
+                texts = ner_data.get("text", [])
+                for t, l in zip(texts, labels):
+                    ner.append((t, l))
+            elif isinstance(ner_data, list):
+                # 旧版 LTP 格式: [{'label': 'Nh', 'text': '张三'}, ...]
+                for d in ner_data:
+                    if isinstance(d, dict):
+                        t = d.get("text", d.get("name", ""))
+                        l = d.get("label", d.get("tag", ""))
+                        ner.append((t, l))
+                        
         return {"tokens": tokens, "dep": dep, "ner": ner}
 
 
@@ -214,10 +249,12 @@ class _RuleBasedFallback(_NlpBackend):
         return {"tokens": list(text), "dep": [], "ner": ner}
 
 
-def _load_nlp_backend() -> _NlpBackend:
-    """按 LTP → HanLP → 规则 顺序自动降级。"""
+def _load_nlp_backend(ltp_model_path: str = "LTP/small") -> _NlpBackend:
+    """按 LTP → HanLP → 规则 顺序自动降级，ltp_model_path 透传到 LTP 后端。"""
     for BackendCls, label in [(_LtpBackend, "LTP"), (_HanLpBackend, "HanLP")]:
         try:
+            if BackendCls is _LtpBackend:
+                return _LtpBackend(model_path=ltp_model_path)
             return BackendCls()
         except Exception as e:
             warnings.warn(f"[NLP] {label} 加载失败（{e}），尝试下一个。", RuntimeWarning)
@@ -491,6 +528,7 @@ class StageTwoPipeline:
         bge_model_name:   str   = "BAAI/bge-m3",
         use_fp16:         bool  = True,
         intent_threshold: float = 0.72,
+        ltp_model_path:   str   = "LTP/small",
         nlp_backend:      Optional[_NlpBackend] = None,
     ) -> None:
         self._topology = TopologyAnalyzer()
@@ -502,7 +540,13 @@ class StageTwoPipeline:
             radar    = self._radar,
             topology = self._topology,
         )
-        self._syntax = SyntaxFeatureExtractor(backend=nlp_backend)
+        # 若未传入外部 nlp_backend，则使用 _load_nlp_backend 并透传 ltp_model_path
+        if nlp_backend is not None:
+            self._syntax = SyntaxFeatureExtractor(backend=nlp_backend)
+        else:
+            self._syntax = SyntaxFeatureExtractor(
+                backend=_load_nlp_backend(ltp_model_path=ltp_model_path)
+            )
 
     def process_conversation(
         self,

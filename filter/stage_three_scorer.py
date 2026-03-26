@@ -61,6 +61,37 @@ _RESISTANCE_BONUS:             int   = 12
 _RESISTANCE_TAG:               str   = "target_defenseless"
 _RESISTANCE_DECAY_THRESHOLD:   float = 1.5
 
+# ── 标签层级结构（Hierarchical Tagging）────────────────────
+# 底层噪音/OOD 标签集合：当存在任何高危意图时，这些标签必须被压制清除
+# 防止「电商诈骗 + 受害者骂人 → 闲聊 sparse」这种语义冲突
+OOD_NOISE_TAGS: frozenset[str] = frozenset({
+    # OOD 物理兜底
+    "global_business_sparse", "global_too_short", "global_monologue_noise",
+    # LOW_VALUE_NOISE 语义层
+    "low_value_casual_chat", "low_value_wrong_number",
+    "casual_chat_extremely_sparse", "casual_chat",
+    "corporate_logistics_noise", "corporate_bidding_noise",
+    "low_value_industrial_noise", "noise_brush_off_telemarketing",
+    "noise_short_greeting_hangup", "noise_delivery_short",
+    # 拓扑结构性惩罚
+    "structural_chitchat_penalty",
+    # 语音信箱/未接通
+    "unconnected_voicemail_ivr",
+})
+
+# 高危信号标签前缀（用于快速识别是否存在业务/诈骗意图，无需列举所有 topic_id）
+_HIGH_RISK_TAG_PREFIXES: tuple[str, ...] = (
+    "has_fraud_", "has_drug_", "has_coercive_", "has_extremist_",
+    "suspicious_fake_cs", "has_authority_", "coercive_org",
+    "emotional_grooming", "ai_scam_bot_", "multi_topic_compound",
+    "STAGE1_CRITICAL",
+    "fraud_imperative_", "fraud_jargon_", "fraud_object_",
+    "fake_cs_", "critical_", "fraud_failed_target_resisted",
+)
+
+# 受害者抗性状态标签
+_SCAM_ATTEMPT_REJECTED_TAG: str = "scam_attempt_rejected"
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 内部打分工作台
@@ -231,6 +262,7 @@ class IntelligenceScorer:
         self._run_exemption_topics(ctx, stage2_result, all_intents)
         self._run_cross_topic_bonus(ctx, high_risk_hit_count)
         self._run_role_topology(ctx, stage2_result, all_intents)
+        self._run_bot_intent_fusion(ctx, stage2_result, all_intents)
 
         return self._build_output(ctx, stage2_result, nlp_feats)
 
@@ -312,6 +344,7 @@ class IntelligenceScorer:
             """
             全局受害者抵抗降权机制：
             如果高危对话中 Target 明确拒绝/抵抗且顺从度极低，则视为失败的犯罪尝试，大幅扣分。
+            同时追加「诈骗未遂」状态标签（scam_attempt_rejected），具有极高情报价值。
             """
             if not has_high_risk:
                 return
@@ -351,6 +384,8 @@ class IntelligenceScorer:
                         f"（抵抗率={resistance_rate:.2f}或触发绝对识破），案件降级为未遂线索"
                     ),
                 )
+                # 追加「诈骗未遂」状态标签——情报分析的核心信号
+                ctx.tags.add(_SCAM_ATTEMPT_REJECTED_TAG)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # LOW_VALUE_NOISE 降权扣分
@@ -529,6 +564,89 @@ class IntelligenceScorer:
                     reason = "对称平权聊天且无业务顺从，物理结构判定为废话，执行结构性降权"
                 )
 
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # AI 机器人 × 伪装意图 核爆融合逻辑（规则 4）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # 机器人 × 意图融合触发的高危主题集合
+    _BOT_FUSION_HIGH_RISK_TOPICS: frozenset[str] = frozenset({
+        "e_commerce_cs",       # 电商客服伪装
+        "authority_entity",    # 权威机构伪装
+        "fraud_object",        # 诈骗客体
+        "fraud_jargon",        # 诈骗黑话
+    })
+
+    # 融合标签映射（高危主题 → 融合标签）
+    _BOT_FUSION_TAG_MAP: dict[str, str] = {
+        "e_commerce_cs":    "ai_scam_bot_ecommerce",
+        "authority_entity": "ai_scam_bot_authority",
+        "fraud_object":     "ai_scam_bot_fraud_object",
+        "fraud_jargon":     "ai_scam_bot_fraud_jargon",
+    }
+
+    _BOT_FUSION_DELTA: int = 15  # 融合惩罚加分
+
+    @classmethod
+    def _run_bot_intent_fusion(
+        cls,
+        ctx:         _ScoringContext,
+        result:      StageTwoResult,
+        all_intents: set[str],
+    ) -> None:
+        """
+        AI 外呼诈骗法则（规则 4）：
+
+        触发条件（同时满足）：
+        1. 机器人特征明显（以下任一）：
+           - 阶段一 bot_label == BOT
+           - ping_pong_rate < 0.1（几乎无交互）
+           - filler_word_rate < 0.005（极度流畅无口癖）
+        2. 命中高危伪装意图（e_commerce_cs / authority_entity / fraud_object / fraud_jargon）
+
+        执行动作：
+        - delta = +15 融合惩罚加分
+        - 追加高危融合标签
+        """
+        # 检查是否命中高危伪装意图
+        hit_topics = all_intents & cls._BOT_FUSION_HIGH_RISK_TOPICS
+        if not hit_topics:
+            return
+
+        # 检查机器人特征
+        is_bot_signal = False
+        s1_meta = result.metadata.get("stage_one", {})
+
+        # 信号 1：阶段一 bot_label == BOT
+        if s1_meta.get("bot_label") == BotLabel.BOT.value:
+            is_bot_signal = True
+
+        # 信号 2：ping_pong_rate < 0.1（几乎无真正交互）
+        ppr = result.interaction_features.negotiation_ping_pong_rate
+        if ppr < 0.1:
+            is_bot_signal = True
+
+        # 信号 3：filler_word_rate < 0.005（极度流畅）
+        nlp_extra = result.metadata.get("nlp_features_extra", {})
+        fwr = nlp_extra.get("filler_word_rate", 1.0)  # 默认 1.0（真人水平）
+        if fwr < 0.005:
+            is_bot_signal = True
+
+        if not is_bot_signal:
+            return
+
+        # 触发融合：对每个命中的高危主题执行惩罚加分
+        for topic_id in hit_topics:
+            fusion_tag = cls._BOT_FUSION_TAG_MAP.get(topic_id, "ai_scam_bot_generic")
+            ctx.apply(
+                delta  = cls._BOT_FUSION_DELTA,
+                tag    = fusion_tag,
+                reason = (
+                    f"命中 AI 机器人批量外呼与高危意图 [{topic_id}] 融合，"
+                    f"判定为机器诈骗试探 (ping_pong={ppr:.4f}, filler_rate={fwr:.4f})"
+                ),
+            )
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 输出组装
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -537,12 +655,54 @@ class IntelligenceScorer:
     _HIGH_RISK_FLOOR: int = 60
 
     @staticmethod
+    def _apply_tag_suppression(tags: set[str]) -> set[str]:
+        """
+        标签降维压制（Tag Suppression）：
+        
+        层级规则：
+        - 高危意图标签（诈骗/涉毒/暴力/极端等）> OOD 噪音标签（闲聊/废料/碎片）
+        - 当 tags 中存在任何高危信号时，强制移除所有 OOD_NOISE_TAGS 中的底层标签
+        
+        判定高危存在的依据：
+        1. tags 中是否包含 _HIGH_RISK_TAG_PREFIXES 前缀的标签
+        2. tags 中是否包含「诈骗未遂」标签（说明曾经命中高危意图）
+        3. tags 中是否包含 ai_scam_bot_* 系列融合标签
+        
+        示例：
+        输入: {"suspicious_fake_cs", "casual_chat_extremely_sparse", "global_business_sparse", "scam_attempt_rejected"}
+        输出: {"suspicious_fake_cs", "scam_attempt_rejected"}  # 噪音标签被压制
+        """
+        # 快速检查：是否存在高危信号
+        has_risk_signal = False
+        
+        for tag in tags:
+            # 检查前缀匹配
+            if tag.startswith(_HIGH_RISK_TAG_PREFIXES):
+                has_risk_signal = True
+                break
+            # 检查诈骗未遂标签
+            if tag == _SCAM_ATTEMPT_REJECTED_TAG:
+                has_risk_signal = True
+                break
+            # 检查 bot 融合标签
+            if tag.startswith("ai_scam_bot_"):
+                has_risk_signal = True
+                break
+
+        if not has_risk_signal:
+            return tags  # 无高危信号，保留全部标签
+
+        # 存在高危信号 → 压制清除所有 OOD 噪音标签
+        suppressed = tags - OOD_NOISE_TAGS
+        return suppressed
+
+    @staticmethod
     def _build_output(
         ctx:       _ScoringContext,
         result:    StageTwoResult,
         nlp_feats: dict[str, Any],
     ) -> dict[str, Any]:
-        """边界钳位 [0,100] + 结构化情报字典组装。"""
+        """边界钳位 [0,100] + 标签降维压制 + 结构化情报字典组装。"""
         # 【Bug 1 修复】高危兜底锁（Floor Clamp）
         # 如果曾经命中过任何正向加分的高危标签（delta > 0 且非白名单豁免），
         # 即使被受害者抵抗/豁免扣分，底线也是 60 分，保证不会落入垃圾填埋场
@@ -553,6 +713,10 @@ class IntelligenceScorer:
         floor_score = IntelligenceScorer._HIGH_RISK_FLOOR if has_high_risk else _SCORE_MIN
 
         final_score = max(floor_score, min(_SCORE_MAX, ctx.score))
+
+        # ── 标签降维压制（Hierarchical Tag Suppression）──
+        # 在输出前执行：高危意图存在时，清除底层噪音标签，防止语义冲突
+        suppressed_tags = IntelligenceScorer._apply_tag_suppression(ctx.tags)
 
         roles: dict[str, str] = {
             r.speaker_id: r.role.value for r in result.speaker_roles
@@ -570,7 +734,8 @@ class IntelligenceScorer:
         output_dict = {
             "conversation_id":      result.conversation_id,
             "final_score":          final_score,
-            "tags":                 sorted(ctx.tags),
+            "tags":                 sorted(suppressed_tags),
+            "tags_suppressed":      sorted(ctx.tags - suppressed_tags),  # 被压制掉的标签（审计用）
             "track_type":           result.track_type.value,
             "roles":                roles,
             "nlp_features_summary": nlp_bool_summary,
@@ -627,8 +792,9 @@ class IntelligenceScorer:
 # BotConfidenceEngine —— 多维置信度机器人检测引擎
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Voicemail 正则词库（用于 AdvancedVoicemailDetector）
+# Voicemail 正则词库（用于 AdvancedVoicemailDetector）—— 多语言：中/英/日/粤
 _VOICEMAIL_REGEX_WORDS: list[str] = [
+    # ── 中文语音信箱/未接通提示 ──
     "无法接通", "暂时无法接通", "正在通话中", "电话正忙",
     "不在服务区", "已启用来电提醒", "无人接听", "呼叫超时",
     "已挂断", "请在提示音后留言", "录音完成后挂断",
@@ -636,8 +802,18 @@ _VOICEMAIL_REGEX_WORDS: list[str] = [
     "转接语音信箱", "正在为您转接", "号码是空号",
     "已停机", "已过期", "请勿挂机", "余额不足",
     "通话已被录音", "会议通话中", "等待音乐",
-    "The number you dialed", "leave a message", "mailbox is full",
-    "call is being transferred", "line is busy",
+    # ── 英文 Voicemail/IVR ──
+    "The number you dialed", "leave a message", "after the beep",
+    "mailbox is full", "call is being transferred", "line is busy",
+    "not available", "voicemail", "press 1",
+    "please hold", "all agents are busy", "your call is important",
+    "no one is available", "record your message", "at the tone",
+    # ── 日文留守番電話/転送 ──
+    "留守番電話", "発信音の後に", "ピーという音が鳴りましたら",
+    "メッセージを残して", "おかけになった電話番号",
+    "電源が切れています", "通話中です", "応答なし",
+    # ── 粤語未接通 ──
+    "嗶一聲之後", "唔得閒", "留低訊息", "話機冇訊號",
 ]
 
 
