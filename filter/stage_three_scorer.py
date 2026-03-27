@@ -209,7 +209,6 @@ class IntelligenceScorer:
             tid: td
             for tid, td in registry.items()
             if td.category == TopicCategory.HIGH_RISK
-            and td.scoring_rules.standalone_score != 0  # 过滤纯辅助主题（emotion等）
         }
         self._noise_topics = {
             tid: td for tid, td in registry.items()
@@ -290,7 +289,12 @@ class IntelligenceScorer:
 
         # 🚨 严格锁定骗子（Agent）的句法特征
         agent_sid = _find_role(stage2_result.speaker_roles, RoleLabel.AGENT)
-        agent_nlp_feats = speaker_nlp_feats.get(agent_sid) if agent_sid else nlp_feats
+        agent_nlp_feats = dict(nlp_feats) 
+        if agent_sid and agent_sid in speaker_nlp_feats:
+            # 👇 修复：智能合并。绝对不允许专属字典里的 False 覆盖掉全局的 True！
+            for k, v in speaker_nlp_feats[agent_sid].items():
+                if v:  # 只有当专属特征为 True 时，才合并进去
+                    agent_nlp_feats[k] = v
 
         # ── 1. HIGH_RISK：动态矩阵加分 ──
         high_risk_hit_count = self._run_high_risk_topics(ctx, all_intents, agent_nlp_feats)
@@ -840,11 +844,13 @@ class IntelligenceScorer:
         """
         ifeats = stage2_result.interaction_features
         valid_turns = sum(1 for t in stage2_result.dialogue_turns if not t.is_backchannel)
+        total_words = sum(t.word_count for t in stage2_result.dialogue_turns if not t.is_backchannel)
         
         # 构建统一的上下文快照 (Runtime Evaluation Context)
         eval_context: dict[str, Any] = {
             "valid_turn_count": valid_turns,
             "compliance_rate":  ifeats.compliance_rate,
+            "total_words":      total_words,
             "ping_pong_rate":   ifeats.negotiation_ping_pong_rate,
             **nlp_feats  # 将所有的 NLP 布尔特征混入上下文
         }

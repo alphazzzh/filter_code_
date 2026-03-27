@@ -226,7 +226,8 @@ OOD_FALLBACK_REGISTRY: list[OODFallbackRule] = [
         tag="global_too_short",
         reason="未命中高危主题，且有效交互轮次过少，判定为碎片废料",
         # 依赖拓扑引擎计算的有效交互轮次
-        condition=lambda ctx: ctx.get("valid_turn_count", 0) <= 3
+        # 👇 只有轮次少 且 字数少，才算是真废料
+        condition=lambda ctx: ctx.get("valid_turn_count", 0) <= 3 and ctx.get("total_words", 0) < 30
     ),
     OODFallbackRule(
         rule_id="monologue_noise",
