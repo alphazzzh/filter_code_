@@ -133,6 +133,7 @@ class MatrixCombination:
     bonus_tag:      str
     # 如果为 True，则表示当该硬特征【不存在】时才触发此矩阵
     requires_absence: bool = False
+    is_independent: bool = False
 
 
 @dataclass
@@ -686,15 +687,25 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
     category    = TopicCategory.HIGH_RISK,
     description = "电商/泛金融客服伪装起手式，配合诈骗客体或高压句法形成连招",
     threshold   = 0.72,
-        bge_anchors=[],
+    bge_anchors=[],
+    syntax_rules = [
+        # 👇 补上这个专门针对微保/百万保障诈骗的核爆级硬探针
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.REGEX_PATTERN,
+            feature_name = "has_insurance_scam_keywords",
+            params       = {
+                "pattern": r"(百万保障|微保|安全保险|账户保险|资金安全险).{0,30}(到期|收费|扣费|解除|关闭|续费)|(微信|支付宝|拼多多).{0,30}(百万保障|微保|客服中心)"
+            }
+        )
+    ],
     scoring_rules = ScoringRules(
         standalone_score = 15,
         standalone_tag   = "suspicious_fake_cs",
         matrix_combinations = [
-            # 电商客服 × 诈骗客体(验证码/屏幕共享) = 诈骗无疑
             MatrixCombination("has_fraud_object", 45, "fake_cs_screen_share_trap"),
-            # 电商客服 × 胁迫句法(如果不...否则) = 恐吓扣费
             MatrixCombination("has_coercive_threat", 40, "fake_cs_financial_threat"),
+            # 👇 将其设为独立触发！
+            MatrixCombination("has_insurance_scam_keywords", 50, "critical_insurance_scam", is_independent=True),
         ],
     ),
 )

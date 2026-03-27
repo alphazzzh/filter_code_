@@ -333,38 +333,39 @@ class IntelligenceScorer:
         hit_count = 0
 
         for topic_id, topic_def in self._high_risk_topics.items():
-            # 检查软意图是否命中
-            if topic_id not in all_intents:
-                continue
-
+            has_soft_intent = topic_id in all_intents
             topic_hit = False
             matrix_hit = False
 
-            # Step B：矩阵组合扫描（优先级高于单项分）
+            # Step B：矩阵组合扫描 (优先判断矩阵，不再提前 continue)
             for combo in topic_def.scoring_rules.matrix_combinations:
+                # 核心逻辑：如果不是独立探针，且软意图也没命中，才跳过
+                if not combo.is_independent and not has_soft_intent:
+                    continue
+
                 hard_feat_value = bool(agent_nlp_feats.get(combo.syntax_feature, False))
                 
-                # 👇 新增：识别正向/负向触发逻辑
                 triggered = False
                 if combo.requires_absence and not hard_feat_value:
-                    triggered = True  # 要求不存在且确实不存在 -> 触发
+                    triggered = True  
                 elif not combo.requires_absence and hard_feat_value:
-                    triggered = True  # 要求存在且确实存在 -> 触发
+                    triggered = True  
 
                 if triggered:
                     ctx.apply(
                         delta  = combo.bonus_score,
                         tag    = combo.bonus_tag,
                         reason = (
-                            f"矩阵命中 [{'!' if combo.requires_absence else ''}{combo.syntax_feature}] × [{topic_id}]"
-                            f" → {combo.bonus_score:+d}"
+                            f"矩阵命中 [{'!' if combo.requires_absence else ''}{combo.syntax_feature}] "
+                            f"{'(独立触发)' if combo.is_independent else '× [' + topic_id + ']'} "
+                            f"→ {combo.bonus_score:+d}"
                         ),
                     )
                     matrix_hit = True
                     topic_hit  = True
 
-            # Step A：单项基础分（矩阵未触发时才给，避免双重计分）
-            if not matrix_hit and topic_def.scoring_rules.standalone_score != 0:
+            # Step A：单项基础分（矩阵未触发，且大模型命中时才给）
+            if not matrix_hit and has_soft_intent and topic_def.scoring_rules.standalone_score != 0:
                 ctx.apply(
                     delta  = topic_def.scoring_rules.standalone_score,
                     tag    = topic_def.scoring_rules.standalone_tag,
@@ -667,7 +668,7 @@ class IntelligenceScorer:
         total_words = sum(t.word_count for t in non_bc_turns)
 
         # 信号 1：阶段一 bot_label == BOT
-        if s1_meta.get("bot_label") == BotLabel.BOT.value:
+        if s1_meta.get("bot_label") == BotLabel.BOT.value and total_words >= 30:
             is_bot_signal = True
 
         # 信号 2：ping_pong_rate < 0.1（几乎无真正交互）
@@ -755,13 +756,19 @@ class IntelligenceScorer:
     ) -> dict[str, Any]:
         """边界钳位 [0,100] + 标签降维压制 + 结构化情报字典组装。"""
         # 【Bug 1 修复】高危兜底锁（Floor Clamp）
-        # 如果曾经命中过任何正向加分的高危标签（delta > 0 且非白名单豁免），
-        # 即使被受害者抵抗/豁免扣分，底线也是 60 分，保证不会落入垃圾填埋场
         has_high_risk = any(
             e["delta"] > 0 and not e["tag"].startswith("official")
             for e in ctx.events
         )
-        floor_score = IntelligenceScorer._HIGH_RISK_FLOOR if has_high_risk else _SCORE_MIN
+
+        # 👇 新增：检查是否命中了强效安全白名单（分数 <= -40 且带有 safe/whitelist 标识）
+        is_whitelisted = any(
+            e["delta"] <= -40 and ("whitelist" in e["tag"] or "safe" in e["tag"])
+            for e in ctx.events
+        )
+
+        # 👇 修改：如果存在超级白名单豁免，直接撤销高危底线锁，允许分数下探到安全区
+        floor_score = IntelligenceScorer._HIGH_RISK_FLOOR if (has_high_risk and not is_whitelisted) else _SCORE_MIN
 
         final_score = max(floor_score, min(_SCORE_MAX, ctx.score))
 
@@ -944,6 +951,11 @@ class BotConfidenceEngine:
             }
 
         # ── 加分项 ────────────────────────────────────────
+        
+        # 👇 1. 新增：计算有效轮次和总字数，为后面的防误判做准备
+        non_bc_turns = [t for t in stage2_result.dialogue_turns if not t.is_backchannel]
+        valid_turns_count = len(non_bc_turns)
+        total_words = sum(t.word_count for t in non_bc_turns)
 
         # 加分 1：命中 csr_bot_whitelist
         if "csr_bot_whitelist" in all_intents:
@@ -951,19 +963,20 @@ class BotConfidenceEngine:
             details.append(f"命中 csr_bot_whitelist → +{self._SCORE_CSR_WHITELIST}")
 
         # 加分 2：极度流畅（语气词极少）
-        if filler_word_rate < self._FLUENCY_THRESHOLD:
+        # 👇 2. 增加字数限制条件：and total_words >= 30
+        if filler_word_rate < self._FLUENCY_THRESHOLD and total_words >= 30:
             score += self._SCORE_FLUENCY
             details.append(
-                f"filler_word_rate={filler_word_rate:.4f} < {self._FLUENCY_THRESHOLD} → +{self._SCORE_FLUENCY}"
+                f"filler_word_rate={filler_word_rate:.4f} < {self._FLUENCY_THRESHOLD} (字数={total_words}) → +{self._SCORE_FLUENCY}"
             )
 
         # 加分 3：ping_pong_rate 极度规律
         ppr = stage2_result.interaction_features.negotiation_ping_pong_rate
-        # 机器人外呼的 ping_pong 通常为 0（独白）或极低
-        if ppr < 0.05:
+        # 👇 3. 增加轮次限制条件：and valid_turns_count >= 4
+        if ppr < 0.05 and valid_turns_count >= 4:
             score += self._SCORE_PING_PONG
             details.append(
-                f"ping_pong_rate={ppr:.4f} < 0.05 → +{self._SCORE_PING_PONG}"
+                f"ping_pong_rate={ppr:.4f} < 0.05 (轮次={valid_turns_count}) → +{self._SCORE_PING_PONG}"
             )
 
         # ── 最终判定 ──────────────────────────────────────

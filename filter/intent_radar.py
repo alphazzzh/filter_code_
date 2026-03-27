@@ -32,33 +32,65 @@ except ImportError:
 import logging
 logger = logging.getLogger(__name__)
 
+import re
+_RE_SENTENCE_BOUNDARY = re.compile(r"[。！？；\n.!?]+")
+_RE_CLAUSE_BOUNDARY = re.compile(r"[，、,]")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 语义滑窗切片（Semantic Sliding Window）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# 默认滑窗参数：窗口=20 字符，步长=10 字符
-_DEFAULT_WINDOW_SIZE: int = 20
-_DEFAULT_STRIDE:      int = 10
-
-
-def _sliding_window(
-    text: str,
-    window_size: int = _DEFAULT_WINDOW_SIZE,
-    stride: int = _DEFAULT_STRIDE,
-) -> list[str]:
+def _semantic_chunking(text: str, max_chunk_length: int = 80) -> list[str]:
     """
-    将长文本按滑窗切片为多个短片段，解决核心意图被向量空间稀释的问题。
-
-    算法：
-    - 文本长度 <= window_size → 返回原文本（无需切片）
-    - 否则按 stride 步长滑动，生成多个重叠片段
-
-    性能：纯字符串切片，O(n) 时间复杂度，无正则开销。
+    动态语义切片：优先按句号切分，超长再按逗号切分，极限情况才用滑窗。
     """
-    if len(text) <= window_size:
-        return [text]
-    return [text[i:i + window_size] for i in range(0, len(text), stride)]
+    if not text.strip():
+        return []
+
+    # 第一层：按大边界（完整句子）切分
+    raw_sentences = _RE_SENTENCE_BOUNDARY.split(text)
+    chunks = []
+
+    for sentence in raw_sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        if len(sentence) <= max_chunk_length:
+            chunks.append(sentence)
+        else:
+            # 第二层：超长句按小边界（逗号）切分合并
+            clauses = _RE_CLAUSE_BOUNDARY.split(sentence)
+            current_chunk = ""
+            for clause in clauses:
+                clause = clause.strip()
+                if not clause:
+                    continue
+                # 如果加上这个子句还不超长，就合并
+                if len(current_chunk) + len(clause) + 1 <= max_chunk_length:
+                    current_chunk = f"{current_chunk}，{clause}" if current_chunk else clause
+                else:
+                    # 如果当前块有内容，先保存
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                    
+                    # 极限兜底：如果单个子句本身就超长，启用大尺度机械滑窗
+                    if len(clause) > max_chunk_length:
+                        window = 60
+                        stride = 30
+                        for i in range(0, len(clause), stride):
+                            sub_chunk = clause[i:i+window]
+                            if len(sub_chunk) >= 10: 
+                                chunks.append(sub_chunk)
+                        current_chunk = ""
+                    else:
+                        current_chunk = clause
+
+            if current_chunk:
+                chunks.append(current_chunk)
+
+    # 过滤掉极短的无意义切片（< 5个字）
+    return [c for c in chunks if len(c) >= 5]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -249,7 +281,7 @@ class IntentRadar:
         chunk_map:   list[list[int]] = []       # chunk_map[i] = 该文本对应的切片索引范围 [start, end)
 
         for text in texts:
-            chunks = _sliding_window(text)
+            chunks = _semantic_chunking(text)
             start = len(all_chunks)
             all_chunks.extend(chunks)
             chunk_map.append((start, len(all_chunks)))
