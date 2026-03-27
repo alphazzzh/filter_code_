@@ -279,6 +279,14 @@ class IntelligenceScorer:
         all_intents: set[str]     = _collect_all_intents(stage2_result.dialogue_turns)
         nlp_feats:   dict[str, Any] = stage2_result.metadata.get("nlp_features", {})
         speaker_nlp_feats: dict[str, dict[str, Any]] = stage2_result.metadata.get("speaker_nlp_features", {})
+        # 👇 1. 从 metadata 中安全提取 nlp_extra 和 filler_word_rate
+        nlp_extra = stage2_result.metadata.get("nlp_features_extra", {})
+        fwr = nlp_extra.get("filler_word_rate", 1.0)
+
+        # 👇 2. 调用高级 Bot 引擎获取权威结论 (注意参数对应)
+        bot_engine = BotConfidenceEngine()
+        bot_eval = bot_engine.evaluate(stage2_result, filler_word_rate=fwr)
+        is_bot_verdict = (bot_eval["bot_label"] == BotLabel.BOT)
 
         # 🚨 严格锁定骗子（Agent）的句法特征
         agent_sid = _find_role(stage2_result.speaker_roles, RoleLabel.AGENT)
@@ -307,7 +315,7 @@ class IntelligenceScorer:
         self._run_exemption_topics(ctx, stage2_result, all_intents)
         self._run_cross_topic_bonus(ctx, high_risk_hit_count)
         self._run_role_topology(ctx, stage2_result, all_intents)
-        self._run_bot_intent_fusion(ctx, stage2_result, all_intents)
+        self._run_bot_intent_fusion(ctx, stage2_result, all_intents, is_bot_verdict)
 
         return self._build_output(ctx, stage2_result, nlp_feats)
 
@@ -639,6 +647,7 @@ class IntelligenceScorer:
         ctx:         _ScoringContext,
         result:      StageTwoResult,
         all_intents: set[str],
+        is_bot:      bool,
     ) -> None:
         """
         AI 外呼诈骗法则（规则 4）：
@@ -659,33 +668,37 @@ class IntelligenceScorer:
         if not hit_topics:
             return
 
-        # 检查机器人特征
-        is_bot_signal = False
-        s1_meta = result.metadata.get("stage_one", {})
 
-        # ── 短文本保护：计算非 backchannel 轮次总数和总字数 ──
-        non_bc_turns = [t for t in result.dialogue_turns if not t.is_backchannel]
-        total_words = sum(t.word_count for t in non_bc_turns)
-
-        # 信号 1：阶段一 bot_label == BOT
-        if s1_meta.get("bot_label") == BotLabel.BOT.value and total_words >= 30:
-            is_bot_signal = True
-
-        # 信号 2：ping_pong_rate < 0.1（几乎无真正交互）
-        # 修复：只有当存在至少 4 个轮次时，ping_pong 为 0 才是不正常的机器单向输出
-        ppr = result.interaction_features.negotiation_ping_pong_rate
-        if ppr < 0.1 and len(non_bc_turns) >= 4:
-            is_bot_signal = True
-
-        # 信号 3：filler_word_rate < 0.005（极度流畅）
-        # 修复：只有当对话总字数 >= 30 时，0 结巴率才有判定意义
-        nlp_extra = result.metadata.get("nlp_features_extra", {})
-        fwr = nlp_extra.get("filler_word_rate", 1.0)  # 默认 1.0（真人水平）
-        if fwr < 0.005 and total_words >= 30:
-            is_bot_signal = True
-
-        if not is_bot_signal:
+        # 👇 核心修复：直接听从高级引擎的结论，如果不是 Bot，直接退出！
+        if not is_bot:
             return
+        # # 检查机器人特征
+        # is_bot_signal = False
+        # s1_meta = result.metadata.get("stage_one", {})
+
+        # # ── 短文本保护：计算非 backchannel 轮次总数和总字数 ──
+        # non_bc_turns = [t for t in result.dialogue_turns if not t.is_backchannel]
+        # total_words = sum(t.word_count for t in non_bc_turns)
+
+        # # 信号 1：阶段一 bot_label == BOT
+        # if s1_meta.get("bot_label") == BotLabel.BOT.value and total_words >= 30:
+        #     is_bot_signal = True
+
+        # # 信号 2：ping_pong_rate < 0.1（几乎无真正交互）
+        # # 修复：只有当存在至少 4 个轮次时，ping_pong 为 0 才是不正常的机器单向输出
+        # ppr = result.interaction_features.negotiation_ping_pong_rate
+        # if ppr < 0.1 and len(non_bc_turns) >= 4:
+        #     is_bot_signal = True
+
+        # # 信号 3：filler_word_rate < 0.005（极度流畅）
+        # # 修复：只有当对话总字数 >= 30 时，0 结巴率才有判定意义
+        # nlp_extra = result.metadata.get("nlp_features_extra", {})
+        # fwr = nlp_extra.get("filler_word_rate", 1.0)  # 默认 1.0（真人水平）
+        # if fwr < 0.005 and total_words >= 30:
+        #     is_bot_signal = True
+
+        # if not is_bot_signal:
+        #     return
 
         # 触发融合：对每个命中的高危主题执行惩罚加分
         for topic_id in hit_topics:
