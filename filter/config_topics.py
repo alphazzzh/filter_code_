@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 import json
+import re
 from pathlib import Path
 
 
@@ -914,6 +915,27 @@ PROFANITY_REGISTRY: list[str] = [
     "仆街", "冚家剷", "撚", "閪", "丢你老母", "傻嗨", "仆街啦",
     # ── 韩语脏话/攻击 ──
     "병신", "개새끼", "씨발", "존나",
+]
+
+
+# ─────────────────────────────────────────────────────────────
+# 全局红线前置熔断注册表（GLOBAL_REDLINE_REGISTRY）
+# ─────────────────────────────────────────────────────────────
+# 涉恐/涉暴/极端组织的绝对底线词汇。
+# 触发时绕过大模型全链路，直接判死（final_score=100）。
+# ─────────────────────────────────────────────────────────────
+GLOBAL_REDLINE_REGISTRY: list[re.Pattern] = [
+    re.compile(r"制造炸弹|自制炸药|遥控引爆|法轮功|全能神|奉父神|审判魔鬼|神的惩罚|度人|真善忍|三退保平安"),
+    re.compile(r"人体炸弹|自杀式袭击|汽车炸弹|武装颠覆|制造炸弹|推翻政权|分裂国家|独立势力|暴恐袭击"),
+    re.compile(r"恐怖袭击|恐怖组织|恐怖分子"),
+    re.compile(r"极端组织|ISIS|ISIL|达伊沙"),
+    re.compile(r"生化武器|炭疽杆菌|沙林毒气"),
+    re.compile(r"劫持人质|绑架勒索赎金"),
+    re.compile(r"purchase explosives|build a bomb"),
+    re.compile(r"biological weapon|anthrax attack"),
+    re.compile(r"terrorist attack|mass shooting"),
+    re.compile(r"爆弾製造|テロ組織|自爆テロ"),
+    re.compile(r"테러 조직|폭탄 제조|생화학 무기"),
 ]
 
 

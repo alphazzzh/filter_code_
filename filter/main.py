@@ -399,12 +399,23 @@ def run_pipeline(config: PipelineConfig) -> None:
                 stats["stage2_processed"] += 1
             except Exception as exc:
                 logger.error(
-                    f"[Stage2] conv={conv_id} 处理失败，降级为 LITE 输出：{exc}",
+                    f"[Stage2] conv={conv_id} 处理失败，降级输出：{exc}",
                     exc_info=True,
                 )
-                lite_result = _build_lite_result(conv_id, s1_records)
-                lite_result["_error"] = str(exc)
-                _write_json_line(out_f, lite_result)
+                fallback_result = {
+                    "conversation_id":     conv_id,
+                    "final_score":         50,
+                    "tags":                ["stage2_error_fallback"],
+                    "track_type":          "n/a",
+                    "roles":               {},
+                    "interaction_summary": {},
+                    "nlp_features_summary": {},
+                    "score_breakdown":     [{"delta": 0, "tag": "stage2_error", "reason": f"阶段二处理异常，降级兜底：{exc}"}],
+                    "_route":              "PASS",
+                    "_error":              str(exc),
+                    "_processed_at":       datetime.utcnow().isoformat(),
+                }
+                _write_json_line(out_f, fallback_result)
                 continue
 
             # ── 阶段三/四/五：打分 ────────────────────────────

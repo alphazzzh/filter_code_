@@ -345,7 +345,7 @@ class RoleBinder:
                     confidence = 0.85,
                     evidence   = ["高情绪密度", "无业务提案/顺从模式", "双方字数接近"],
                 )
-                for i, sid in enumerate(speakers[:2])  # 最多处理两方
+                for i, sid in enumerate(speakers)  # 覆盖所有 speaker，防止 pydantic 校验失败
             ]
 
         # ── Driver / Follower 识别 ─────────────────────────────
@@ -387,7 +387,7 @@ class RoleBinder:
                     confidence = 0.50,
                     evidence   = ["Driver/Follower 特征不显著，保守标记为平权"],
                 )
-                for i, sid in enumerate(speakers[:2])
+                for i, sid in enumerate(speakers)  # 覆盖所有 speaker
             ]
 
         assigned_sids = {r.speaker_id for r in results}

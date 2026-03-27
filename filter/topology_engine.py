@@ -413,7 +413,7 @@ class TopologyEngine:
 
             # 单字符级别语气词检测（仅对未被多字节匹配的字符）
             for i, ch in enumerate(text):
-                if not ch.isspace() and i not in matched_positions and ch.lower() in "嗯啊哦呢呀哈哟喔唔嘿吧诶"
+                if not ch.isspace() and i not in matched_positions and ch.lower() in "嗯啊哦呢呀哈哟喔唔嘿吧诶":
                     # 单字符语气词贡献 0.5（因为一个中文字通常 = 1 词但语气价值较低）
                     filler_hits += 0.5
 
