@@ -143,10 +143,12 @@ class DataPayload(BaseModel):
         if isinstance(v, str):
             try:
                 parsed = json.loads(v)
-                if not isinstance(parsed, list): raise ValueError("Must be a JSON array.")
-                return parsed
+                if isinstance(parsed, list): 
+                    return parsed
             except json.JSONDecodeError:
-                raise ValueError("Content is a string but NOT valid JSON.")
+                pass # 忽略 JSON 解析错误
+            # 👇 核心改动：如果不是 JSON 数组，直接原样返回纯文本字符串，交由下游正则处理
+            return v 
         return v
 
 class AnalyzeRequest(BaseModel):
@@ -197,18 +199,26 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
         # ── Step 1: 解析 ──
         raw_turns = req.data.content
         records = []
-        for turn in raw_turns:
-            if isinstance(turn, dict):
-                r_id  = str(turn.get("id", ""))
-                r_spk = str(turn.get("speaker", ""))
-                r_txt = str(turn.get("content", ""))
-            else:
-                # 兼容 Pydantic Model (V1 dict() / V2 model_dump())
-                r_id  = str(getattr(turn, "id", ""))
-                r_spk = str(getattr(turn, "speaker", ""))
-                r_txt = str(getattr(turn, "content", ""))
-                
-            records.append(ASRRecord(record_id=r_id, speaker_id=r_spk, raw_text=r_txt))
+        
+        # 👇 智能路由：如果是纯字符串，调用 main.py 里的强大正则解析器
+        if isinstance(raw_turns, str):
+            from main import parse_transcript_cell
+            records = parse_transcript_cell(raw_turns, req.session_id)
+            
+        # 👇 否则，走原来的结构化 JSON 数组解析逻辑
+        else:
+            for turn in raw_turns:
+                if isinstance(turn, dict):
+                    r_id  = str(turn.get("id", ""))
+                    r_spk = str(turn.get("speaker", ""))
+                    r_txt = str(turn.get("content", ""))
+                else:
+                    # 兼容 Pydantic Model (V1 dict() / V2 model_dump())
+                    r_id  = str(getattr(turn, "id", ""))
+                    r_spk = str(getattr(turn, "speaker", ""))
+                    r_txt = str(getattr(turn, "content", ""))
+                    
+                records.append(ASRRecord(record_id=r_id, speaker_id=r_spk, raw_text=r_txt))
         if not records:
             response.status_code = status.HTTP_400_BAD_REQUEST
             return StandardResponse(status=400, message="Content array is empty", session_id=req.session_id)

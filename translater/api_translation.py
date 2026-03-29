@@ -11,6 +11,54 @@ from translator_engine import LLMTranslatorService
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 logger = logging.getLogger("api_translation")
 
+import re
+
+def parse_transcript_to_turns(raw_text: str, session_id: str) -> list[DialogueTurn]:
+    """
+    带记忆状态的翻译单元格解析器。
+    直接将长文本解析为翻译引擎所需的 DialogueTurn 对象。
+    """
+    records = []
+    lines = raw_text.strip().splitlines()
+    pattern = re.compile(r"^(.+?)说[：:,，；;]\s*(.*)$")
+    
+    current_speaker = None
+    current_text_blocks = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        match = pattern.match(line)
+        if match:
+            if current_speaker is not None and current_text_blocks:
+                joined_text = " ".join(current_text_blocks).strip()
+                if joined_text:
+                    records.append(DialogueTurn(
+                        id=f"{session_id}_{len(records):04d}",
+                        speaker=current_speaker,
+                        content=joined_text
+                    ))
+            current_speaker = match.group(1).strip()
+            current_text_blocks = [match.group(2).strip()]
+        else:
+            if current_speaker is not None:
+                current_text_blocks.append(line)
+            else:
+                current_speaker = "Unknown"
+                current_text_blocks = [line]
+                
+    if current_speaker is not None and current_text_blocks:
+        joined_text = " ".join(current_text_blocks).strip()
+        if joined_text:
+            records.append(DialogueTurn(
+                id=f"{session_id}_{len(records):04d}",
+                speaker=current_speaker,
+                content=joined_text
+            ))
+            
+    return records
+
 app = FastAPI(title="Text Translation API", version="1.0.0")
 
 # 初始化翻译大脑（单例模式）
@@ -43,14 +91,23 @@ async def translate_endpoint(raw_request: Request) -> JSONResponse:
 
     try:
         # ========================================================
-        # 1. 严格参数校验 (此步骤会自动调用 Pydantic 中的 JSON 字符串解析器)
+        # 1. 严格参数校验 
         # ========================================================
         req = TranslateRequest(**raw_body)
         
+        # 👇 智能路由：判断 content 是字符串还是预解析的列表
+        if isinstance(req.data.content, str):
+            # 将纯文本通过正则切分为翻译引擎需要的 DialogueTurn 列表
+            dialogue_turns = parse_transcript_to_turns(req.data.content, req.session_id)
+        else:
+            # 已经是合法的 JSON 列表
+            dialogue_turns = req.data.content
+
         # ========================================================
         # 2. 抛给后端算法引擎执行整段上下文翻译
         # ========================================================
-        translated_items = await _translator.translate(req.data.content)
+        # 👇 把原先的 req.data.content 替换为智能路由后的 dialogue_turns
+        translated_items = await _translator.translate(dialogue_turns)
 
         # ========================================================
         # 3. 封装标准成功响应

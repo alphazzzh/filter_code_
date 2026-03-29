@@ -295,6 +295,25 @@ class IntelligenceScorer:
             for k, v in speaker_nlp_feats[agent_sid].items():
                 if v:  # 只有当专属特征为 True 时，才合并进去
                     agent_nlp_feats[k] = v
+        elif not agent_sid and speaker_nlp_feats:
+            # 路径 2：平权聊天（没有明确 AGENT） -> 启动“动态嫌疑人推举”
+            # 寻找个人特征中，命中高危动作最多的那个人，把他当做潜在嫌疑人，避免 AB 交叉污染！
+            suspect_sid = None
+            max_risk_flags = -1
+            
+            # 定义哪些句法属于强迫性动作
+            risk_keys = {"has_imperative_syntax", "has_coercive_threat", "has_guide_behavior"}
+            
+            for sid, feats in speaker_nlp_feats.items():
+                risk_count = sum(1 for k in risk_keys if feats.get(k))
+                if risk_count > max_risk_flags:
+                    max_risk_flags = risk_count
+                    suspect_sid = sid
+                    
+            # 如果选出了嫌疑人，且他确实发出了高危动作，合并他的特征
+            if suspect_sid and max_risk_flags > 0:
+                for k, v in speaker_nlp_feats[suspect_sid].items():
+                    if v: agent_nlp_feats[k] = v
 
         # ── 1. HIGH_RISK：动态矩阵加分 ──
         high_risk_hit_count = self._run_high_risk_topics(ctx, all_intents, agent_nlp_feats)
@@ -400,50 +419,61 @@ class IntelligenceScorer:
             has_high_risk: bool,
         ) -> None:
             """
-            全局受害者抵抗降权机制：
-            如果高危对话中 Target 明确拒绝/抵抗且顺从度极低，则视为失败的犯罪尝试，大幅扣分。
+            全局受害者抵抗降权机制（已修复平权聊天盲区与类型错误）：
+            如果高危对话中潜在受害者明确拒绝/抵抗且顺从度极低，则视为失败的犯罪尝试，大幅扣分。
             同时追加「诈骗未遂」状态标签（scam_attempt_rejected），具有极高情报价值。
             """
             if not has_high_risk:
                 return
 
-            target_sid = _find_role(result.speaker_roles, RoleLabel.TARGET)
-            if not target_sid:
-                return
-
-            target_turns = [
-                t for t in result.dialogue_turns
-                if t.speaker_id == target_sid and not t.is_backchannel
+            # 👇 核心修复：result.speaker_roles 是 list[SpeakerRoleResult]
+            # 遍历对象列表，只要角色的 role 属性不是 AGENT，就提取他的 speaker_id
+            potential_resisters = [
+                sr.speaker_id for sr in result.speaker_roles
+                if sr.role != RoleLabel.AGENT
             ]
-            if not target_turns:
+
+            if not potential_resisters:
                 return
 
-            # 收集受害者的所有意图，方便快速判断是否包含绝对的质变信号
-            target_intents = {label for t in target_turns for label in t.intent_labels}
+            # 遍历所有潜在受害者，只要有一人成功抵抗，即可触发降权
+            for target_sid in potential_resisters:
+                target_turns = [
+                    t for t in result.dialogue_turns
+                    if t.speaker_id == target_sid and not t.is_backchannel
+                ]
+                if not target_turns:
+                    continue
 
-            resistance_intents = {"dismissal", "rejection"}
-            resistance_count = sum(
-                1 for t in target_turns if (set(t.intent_labels) & resistance_intents)
-            )
-            resistance_rate = resistance_count / len(target_turns)
+                # 收集该受害者的所有意图，方便快速判断是否包含绝对的质变信号
+                target_intents = {label for t in target_turns for label in t.intent_labels}
 
-            compliance_count = sum(
-                1 for t in target_turns if "compliance" in t.intent_labels
-            )
-            compliance_rate = compliance_count / len(target_turns)
-
-            # 🚨 终极微调：抵抗率 > 0.25 (量变) 或者 明确识破(质变)
-            if (resistance_rate > 0.25 or "dismissal" in target_intents) and compliance_rate < 0.10:
-                ctx.apply(
-                    delta  = -35,
-                    tag    = "fraud_failed_target_resisted",
-                    reason = (
-                        f"检测到高危风险，但受害者明确拒绝/脱战"
-                        f"（抵抗率={resistance_rate:.2f}或触发绝对识破），案件降级为未遂线索"
-                    ),
+                resistance_intents = {"dismissal", "rejection"}
+                resistance_count = sum(
+                    1 for t in target_turns if (set(t.intent_labels) & resistance_intents)
                 )
-                # 追加「诈骗未遂」状态标签——情报分析的核心信号
-                ctx.tags.add(_SCAM_ATTEMPT_REJECTED_TAG)
+                resistance_rate = resistance_count / len(target_turns)
+
+                compliance_count = sum(
+                    1 for t in target_turns if "compliance" in t.intent_labels
+                )
+                compliance_rate = compliance_count / len(target_turns)
+
+                # 🚨 终极微调：抵抗率 > 0.25 (量变) 或者 明确识破(质变)
+                if (resistance_rate > 0.25 or "dismissal" in target_intents) and compliance_rate < 0.10:
+                    ctx.apply(
+                        delta  = -35,
+                        tag    = "fraud_failed_target_resisted",
+                        reason = (
+                            f"检测到高危风险，但疑似受害者({target_sid})明确拒绝/脱战"
+                            f"（抵抗率={resistance_rate:.2f}或触发绝对识破），案件降级为未遂线索"
+                        ),
+                    )
+                    # 追加「诈骗未遂」状态标签——情报分析的核心信号
+                    ctx.tags.add(_SCAM_ATTEMPT_REJECTED_TAG)
+                    
+                    # 只要有一方成功抵抗，即刻生效并退出
+                    return
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # LOW_VALUE_NOISE 降权扣分

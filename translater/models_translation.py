@@ -1,5 +1,5 @@
 import json
-from typing import Any, List
+from typing import Any, List, Union
 from pydantic import BaseModel, validator
 
 # ---------------------------------------------------------
@@ -17,7 +17,7 @@ class DialogueTurn(BaseModel):
 class CallData(BaseModel):
     """话单的 data 字段，所有字段严格必填"""
     session_id: str
-    content: List[DialogueTurn]          
+    content: Union[str, List[DialogueTurn]]         
     language: str
     start_time: str
     end_time: str
@@ -31,23 +31,19 @@ class CallData(BaseModel):
     cp: str
 
     @validator("content", pre=True)
-    def parse_stringified_content(cls, v: Any) -> List[dict]:
-        """
-        兼容上游系统传来的字符串化 JSON 数组：
-        如果上游传来的是 "[{...}, {...}]"，在此处拦截并转为 List[dict]
-        """
+    def parse_stringified_content(cls, v: Any) -> Union[str, List[dict]]:
         if isinstance(v, list):
             return v
-        
         if isinstance(v, str):
             try:
                 parsed = json.loads(v)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"content 字段无法解析为 JSON：{exc}") from exc
-                
-            if not isinstance(parsed, list):
-                raise ValueError(f"content 解析后应为 JSON 数组，实际得到 {type(parsed).__name__}")
-            return parsed
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass # 👇 2. 忽略 JSON 解析错误，说明它是 A说B说的纯文本
+            
+            # 👇 3. 直接原样返回字符串，交由 API 层的智能路由处理
+            return v
             
         raise ValueError(f"content 字段类型不合法：期望 str 或 list，实际为 {type(v).__name__}")
 
