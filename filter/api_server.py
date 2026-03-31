@@ -171,8 +171,8 @@ async def health_check():
     """探针接口：因为 ML 任务被卸载到了线程池，此接口永远能瞬间响应 200"""
     return {"status": "ok", "gpu_queue": state.gpu_semaphore._value}
 
-@app.post("/api/v1/analyze", response_model=StandardResponse)
-async def analyze_conversation(req: AnalyzeRequest, response: Response):
+@app.post("/api/analyze", response_model=StandardResponse)
+async def analyze_conversation(req: AnalyzeRequest, response: Response, debug: bool = False):
     """
     企业级风控分析接口：严格的并发控制与超时降级机制。
     """
@@ -332,6 +332,11 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response):
         final_result = await loop.run_in_executor(state.cpu_pool, _run_scoring_sync)
 
         # ── Step 5: 成功返回 ──
+        if not debug:
+            final_result.pop("bot_confidence", None)
+            final_result.pop("voicemail_detection", None)
+            final_result.pop("topology_metrics", None)
+            final_result.pop("language_detection", None)
         return StandardResponse(status=200, message="OK", session_id=req.session_id, data=final_result)
 
     except Exception as e:

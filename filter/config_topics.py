@@ -536,7 +536,7 @@ _TOPIC_COORDINATED_BROADCAST = TopicDefinition(
         ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 30,
+        standalone_score = 10,
         standalone_tag   = "coordinated_broadcast",
         matrix_combinations = [
             MatrixCombination("high_entity_density", 15, "broadcast_with_dense_entities"),
@@ -673,6 +673,7 @@ _TOPIC_CSR_BOT_WHITELIST = TopicDefinition(
         bge_anchors=[],
     syntax_rules  = [],
     scoring_rules = ScoringRules(
+        standalone_score=-50,
         whitelist_discount = 0.05,  # 最终分数 × 0.05，几乎清零
         standalone_tag     = "whitelist_csr_bot",
     ),
@@ -697,6 +698,14 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
             params       = {
                 "pattern": r"(百万保障|微保|安全保险|账户保险|资金安全险).{0,30}(到期|收费|扣费|解除|关闭|续费)|(微信|支付宝|拼多多).{0,30}(百万保障|微保|客服中心)"
             }
+        ),
+        # 备用金/白条/客服引导链接等泛金融高危探针
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.REGEX_PATTERN,
+            feature_name = "has_financial_scam_keywords",
+            params       = {
+                "pattern": r"(备用金|白条|金条|借呗|微粒贷).{0,30}(额度|关闭|激活|服务费|违约金|征信)|(点击|打开).{0,10}(链接|网址|屏幕共享)|(京东|金融|淘宝|客服).{0,20}(注销|额度|回执)"
+            }
         )
     ],
     scoring_rules = ScoringRules(
@@ -705,8 +714,9 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
         matrix_combinations = [
             MatrixCombination("has_fraud_object", 45, "fake_cs_screen_share_trap"),
             MatrixCombination("has_coercive_threat", 40, "fake_cs_financial_threat"),
-            # 👇 将其设为独立触发！
+            # 独立触发
             MatrixCombination("has_insurance_scam_keywords", 50, "critical_insurance_scam", is_independent=True),
+            MatrixCombination("has_financial_scam_keywords", 50, "critical_financial_scam", is_independent=True),
         ],
     ),
 )

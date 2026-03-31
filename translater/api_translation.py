@@ -4,7 +4,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # 导入分离出去的模型和引擎
-from models_translation import TranslateRequest, TranslateResponse
+# 导入分离出去的模型和引擎
+from models_translation import TranslateRequest, TranslateResponse, DialogueTurn
 from translator_engine import LLMTranslatorService
 
 # 日志配置

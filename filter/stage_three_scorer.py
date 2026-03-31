@@ -130,39 +130,47 @@ def _find_role(roles: list[SpeakerRoleResult], target: RoleLabel) -> str | None:
 def _check_whitelist(
     result: StageTwoResult,
     all_intents: set[str],
+    ctx: _ScoringContext, 
 ) -> tuple[bool, float]:
-    """
-    检查是否命中白名单主题。
-
-    逻辑：
-    1. 阶段一 bot_label == "bot"（有机器人信号）
-    2. 对话中含有白名单主题的软意图（csr_bot_whitelist 被命中）
-    3. 对话中无 HIGH_RISK 主题的意图
-    4. 硬特征 has_imperative_syntax == False
-
-    返回 (is_whitelisted, discount_ratio)
-    """
+    
+    from config_topics import get_topics_by_category, TopicCategory
+    
     whitelist_topics = get_topics_by_category(TopicCategory.WHITELIST)
-    risk_topics      = get_topics_by_category(TopicCategory.HIGH_RISK)
-
-    # 检查是否有白名单意图被命中
-    whitelist_hit_topics = {
-        tid for tid in whitelist_topics if tid in all_intents
-    }
+    whitelist_hit_topics = {tid for tid in whitelist_topics if tid in all_intents}
+    
     if not whitelist_hit_topics:
         return False, 1.0
 
-    # 检查是否有风险意图
-    risk_intent_hit = bool(all_intents & set(risk_topics.keys()))
-    if risk_intent_hit:
+    # 1. 案底感知：是否触发了高危诈骗探针
+    hard_probe_hit = any(e["delta"] > 0 and not e["tag"].startswith("official") for e in ctx.events)
+    
+    # 2. 顺从度感知：获取受害者的最终顺从率
+    ifeats = result.interaction_features
+    compliance_rate = ifeats.compliance_rate if ifeats else 0.0
+
+    # 👇 3. 锚点感知：提取所有受害者在【非敷衍轮次】中表现出的实质性意图
+    potential_victims = [sr.speaker_id for sr in result.speaker_roles if sr.role != RoleLabel.AGENT]
+    victim_intents = {
+        label 
+        for t in result.dialogue_turns
+        if t.speaker_id in potential_victims and not t.is_backchannel
+        for label in t.intent_labels
+    }
+    
+    # 定义“致命顺从锚点”：只有受害者明确发出了遵从指令、确认动作或提供信息的意图时才算数
+    fatal_compliance_anchors = {"compliance", "action_confirmation", "providing_info", "agreement"}
+    has_fatal_anchor = bool(victim_intents & fatal_compliance_anchors)
+
+    # 👇 核心撤销机制（多维联合判定）：
+    # 必须同时满足：有诈骗起手式 + 顺从度较高 + 受害者确确实实做出了实质性的遵从动作
+    if hard_probe_hit and compliance_rate >= 0.2 and has_fatal_anchor:
         return False, 1.0
 
-    # 检查硬特征
+    # 原有的句法拦截保持不变
     nlp_feats = result.metadata.get("nlp_features", {})
     if nlp_feats.get("has_imperative_syntax", False):
         return False, 1.0
 
-    # 取所有命中白名单主题中最低的折扣率（最保守）
     min_discount = min(
         whitelist_topics[tid].scoring_rules.whitelist_discount
         for tid in whitelist_hit_topics
@@ -524,29 +532,45 @@ class IntelligenceScorer:
         all_intents: set[str],
     ) -> None:
         """
-        执行白名单处理逻辑。
-        inbound_official_ivr: 超级白名单，强制扣分（-60）。
-        csr_bot_whitelist:    传统机器人白名单，百分比折扣。
+        运行白名单豁免主题，并附加“多维洗脑撤销（Revocation）”机制。
         """
+        # 调用多维校验函数获取是否允许豁免及折扣率
+        is_wl, discount = _check_whitelist(result, all_intents, ctx)
+
+        # 提取案底、顺从率及致命锚点特征，用于判断是否是被撤销（以便记录日志）
+        hard_probe_hit = any(e["delta"] > 0 and not e["tag"].startswith("official") for e in ctx.events)
+        ifeats = result.interaction_features
+        compliance_rate = ifeats.compliance_rate if ifeats else 0.0
+
+        potential_victims = [sr.speaker_id for sr in result.speaker_roles if sr.role != RoleLabel.AGENT]
+        victim_intents = {
+            label 
+            for t in result.dialogue_turns
+            if t.speaker_id in potential_victims and not t.is_backchannel
+            for label in t.intent_labels
+        }
+        fatal_compliance_anchors = {"compliance", "action_confirmation", "providing_info", "agreement"}
+        has_fatal_anchor = bool(victim_intents & fatal_compliance_anchors)
+
         for tid, td in self._whitelist_topics.items():
-            if tid in ("inbound_official_ivr", "inbound_user_request"):
-                if tid in all_intents:
+            if tid in all_intents:
+                # 如果校验函数返回 False 且满足撤销条件，说明触发了多维联合撤销
+                if not is_wl and hard_probe_hit and compliance_rate >= 0.2 and has_fatal_anchor:
+                    hit_anchors = list(victim_intents & fatal_compliance_anchors)
+                    ctx.apply(
+                        delta  = 0,  
+                        tag    = f"{td.scoring_rules.standalone_tag}_revoked",
+                        reason = f"曾触发白名单[{tid}]，但检测到高危风险且受害者最终做出实质性妥协(compliance={compliance_rate:.2f}, 锚点={hit_anchors})，豁免被强制撤销！"
+                    )
+                    continue 
+                
+                # 如果校验通过且不存在句法拦截，正常应用白名单减分及折扣
+                if is_wl:
+                    # 👇 修复：绝不能把白名单自己的负分打折！直接使用原汁原味的负分进行核减
                     ctx.apply(
                         delta  = td.scoring_rules.standalone_score,
                         tag    = td.scoring_rules.standalone_tag,
-                        reason = f"命中安全白名单 [{tid}]，强制降权防误杀",
-                    )
-
-            elif tid == "csr_bot_whitelist":
-                # 使用原有的复杂启发式判定机器人
-                is_wl, discount = _check_whitelist(result, all_intents)
-                if is_wl:
-                    discounted = round(ctx.score * discount)
-                    delta = discounted - ctx.score
-                    ctx.apply(
-                        delta  = delta,
-                        tag    = td.scoring_rules.standalone_tag,
-                        reason = f"命中机器人白名单（启发式），折扣率={discount:.2f}",
+                        reason = f"命中安全白名单 [{tid}]，强制降权防误杀"
                     )
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -937,11 +961,11 @@ class BotConfidenceEngine:
       - 触发 PROFANITY_REGISTRY（脏话/攻击性词汇）
       - 复杂的反问逻辑（受害者主动反问 + 识破意图）
 
-    最终得分 > 80 判定为 BOT。
+    最终得分 >= 70 判定为 BOT。
     """
 
     # ── 评分阈值 ──────────────────────────────────────────
-    _BOT_THRESHOLD: int = 80
+    _BOT_THRESHOLD: int = 70
 
     # ── 加分权重 ──────────────────────────────────────────
     _SCORE_CSR_WHITELIST:  int = 40
@@ -1029,7 +1053,7 @@ class BotConfidenceEngine:
             )
 
         # ── 最终判定 ──────────────────────────────────────
-        bot_label = BotLabel.BOT if score > self._BOT_THRESHOLD else BotLabel.HUMAN
+        bot_label = BotLabel.BOT if score >= self._BOT_THRESHOLD else BotLabel.HUMAN
         details.append(f"最终得分={score}，阈值={self._BOT_THRESHOLD}，判定={bot_label.value}")
 
         return {
