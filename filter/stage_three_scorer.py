@@ -107,6 +107,7 @@ class _ScoringContext:
     score:  int                  = _BASE_SCORE
     tags:   set[str]             = field(default_factory=set)
     events: list[dict[str, Any]] = field(default_factory=list)
+    global_confidence_discount: float = 1.0  # 受害者抵抗引起的全局风险分乘法衰减系数
 
     def apply(self, delta: int, tag: str | None, reason: str) -> None:
         self.score += delta
@@ -493,6 +494,7 @@ class IntelligenceScorer:
             # 遍历所有潜在受害者，取抵抗最强者的档位
             best_tier_delta = 0
             best_tier_tag = ""
+            best_discount_factor = 1.0  # 对应的乘法衰减系数
             absolute_rejection = False
 
             for target_sid in potential_resisters:
@@ -521,25 +523,30 @@ class IntelligenceScorer:
                     absolute_rejection = True
                     best_tier_delta = self._RESISTANCE_TIER3_DELTA
                     best_tier_tag = self._RESISTANCE_TIER3_TAG
+                    best_discount_factor = 0.4  # Tier 3 / 绝对识破 → 重度衰减
                     break
 
                 # 阶梯判定（取最重的档位）
                 if resistance_rate > self._RESISTANCE_TIER3_RATE:
                     tier_delta = self._RESISTANCE_TIER3_DELTA
                     tier_tag = self._RESISTANCE_TIER3_TAG
+                    tier_discount = 0.4  # Tier 3 → 重度衰减
                 elif resistance_rate > self._RESISTANCE_TIER2_RATE:
                     tier_delta = self._RESISTANCE_TIER2_DELTA
                     tier_tag = self._RESISTANCE_TIER2_TAG
+                    tier_discount = 0.6  # Tier 2 → 中度衰减
                 elif resistance_rate > self._RESISTANCE_TIER1_RATE:
                     tier_delta = self._RESISTANCE_TIER1_DELTA
                     tier_tag = self._RESISTANCE_TIER1_TAG
+                    tier_discount = 0.8  # Tier 1 → 轻度衰减
                 else:
                     continue
 
-                # 取最重档位
+                # 取最重档位（delta 绝对值更大，discount_factor 更小）
                 if abs(tier_delta) > abs(best_tier_delta):
                     best_tier_delta = tier_delta
                     best_tier_tag = tier_tag
+                    best_discount_factor = tier_discount
 
             if best_tier_delta == 0:
                 return
@@ -556,6 +563,11 @@ class IntelligenceScorer:
             )
             # 追加「诈骗未遂」状态标签——情报分析的核心信号
             ctx.tags.add(_SCAM_ATTEMPT_REJECTED_TAG)
+
+            # 设置全局乘法衰减系数（取最小值以保留最强抵抗效果）
+            ctx.global_confidence_discount = min(
+                ctx.global_confidence_discount, best_discount_factor
+            )
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # LOW_VALUE_NOISE 降权扣分
@@ -915,7 +927,22 @@ class IntelligenceScorer:
         # 👇 修改：如果存在超级白名单豁免，直接撤销高危底线锁，允许分数下探到安全区
         floor_score = IntelligenceScorer._HIGH_RISK_FLOOR if (has_high_risk and not is_whitelisted) else _SCORE_MIN
 
-        final_score = max(floor_score, min(_SCORE_MAX, ctx.score))
+        # ── V5.1 全局受害者抵抗乘法衰减 ──
+        # 在 floor_score 钳位之前，对超出基准分的风险净值进行乘法衰减
+        adjusted_score = ctx.score
+        risk_score = ctx.score - _BASE_SCORE
+        if risk_score > 0 and ctx.global_confidence_discount < 1.0:
+            original_risk = risk_score
+            risk_score = int(risk_score * ctx.global_confidence_discount)
+            # 记录衰减事件用于审计
+            ctx.events.append({
+                "delta": risk_score - original_risk,
+                "tag": "global_resistance_discount_applied",
+                "reason": f"由于受害者抵抗，全局风险分进行乘法衰减 (系数 {ctx.global_confidence_discount})"
+            })
+            adjusted_score = _BASE_SCORE + risk_score
+
+        final_score = max(floor_score, min(_SCORE_MAX, adjusted_score))
 
         # ── 标签降维压制（Hierarchical Tag Suppression）──
         # 在输出前执行：高危意图存在时，清除底层噪音标签，防止语义冲突
