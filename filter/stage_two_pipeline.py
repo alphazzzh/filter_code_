@@ -301,7 +301,9 @@ class SyntaxFeatureExtractor:
             r.rule_type in (
                 SyntaxRuleType.NER_DENSITY,
                 SyntaxRuleType.IMPERATIVE_SYNTAX,
-                SyntaxRuleType.VERB_ENTITY_SPARSITY,  # 业务实体稀疏度探针也依赖 NER 解析
+                SyntaxRuleType.VERB_ENTITY_SPARSITY,
+                SyntaxRuleType.CONDITIONAL_THREAT,      # V5.1: 条件胁迫依赖依存句法
+                SyntaxRuleType.ACTION_TARGET_TRIPLET,   # V5.1: 三元组提取依赖 NER
             )
             for r in self._rules.values()
         )
@@ -326,6 +328,19 @@ class SyntaxFeatureExtractor:
 
             elif rule.rule_type == SyntaxRuleType.VERB_ENTITY_SPARSITY:
                 self._extract_verb_entity_sparsity(parsed, rule, feats)
+
+            # ── V5.1 新增：行为学/心理学特征提取器 ────────────
+            elif rule.rule_type == SyntaxRuleType.ISOLATION_REQUEST:
+                self._extract_isolation_request(text, rule, feats)
+
+            elif rule.rule_type == SyntaxRuleType.MICRO_ACTION_COMMAND:
+                self._extract_micro_action_command(text, rule, feats)
+
+            elif rule.rule_type == SyntaxRuleType.CONDITIONAL_THREAT:
+                self._extract_conditional_threat(text, parsed, rule, feats)
+
+            elif rule.rule_type == SyntaxRuleType.ACTION_TARGET_TRIPLET:
+                self._extract_action_target_triplet(text, parsed, rule, feats)
 
         return feats
 
@@ -508,6 +523,178 @@ class SyntaxFeatureExtractor:
         # 如果整通电话的实体数连 threshold 都不够，判定为缺乏有效主宾语的闲聊废料
         if business_entity_count < threshold:
             feats.set_feature(rule.feature_name, True)
+
+    # ── V5.1 新增：行为学/心理学特征提取器 ──────────────────
+
+    @staticmethod
+    def _extract_isolation_request(
+        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+    ) -> None:
+        """
+        ISOLATION_REQUEST：物理隔离与信息阻断检测。
+
+        诈骗核心前提：切断受害者外部信息源。
+        探测维度：
+          - 空间隔离：「找个没人的房间」「把门反锁」「到外面去」
+          - 通讯阻断：「不要挂电话」「开启飞行模式」「拦截短信」「关掉WiFi」
+          - 社交阻断：「不能告诉家人」「国家机密」「不要跟别人说」
+        """
+        isolation_keywords: list[str] = rule.params.get("isolation_keywords", [])
+        if not isolation_keywords:
+            return
+
+        hit_words = [kw for kw in isolation_keywords if kw in text]
+        if hit_words:
+            feats.set_feature(rule.feature_name, True)
+            if rule.evidence_key:
+                feats.add_evidence(rule.evidence_key, hit_words)
+
+    @staticmethod
+    def _extract_micro_action_command(
+        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+    ) -> None:
+        """
+        MICRO_ACTION_COMMAND：服从性测试与微动作指令检测。
+
+        高阶诈骗在切入核心客体前，通过微小指令测试受害者被控程度。
+        探测维度：
+          - 设备操作：「打开免提」「点右上角」「点一下设置」
+          - 屏幕引导：「往下滑」「点击链接」「扫码」
+          - 行为测试：「跟着我读一遍」「你现在打开」「不要动手机」
+        """
+        device_keywords: list[str] = rule.params.get("device_action_keywords", [])
+        if not device_keywords:
+            return
+
+        hit_words = [kw for kw in device_keywords if kw in text]
+        if hit_words:
+            feats.set_feature(rule.feature_name, True)
+            if rule.evidence_key:
+                feats.add_evidence(rule.evidence_key, hit_words)
+
+    @staticmethod
+    def _extract_conditional_threat(
+        text: str,
+        parsed: dict[str, Any],
+        rule: SyntaxRuleConfig,
+        feats: NlpFeatures,
+    ) -> None:
+        """
+        CONDITIONAL_THREAT：条件胁迫与逻辑陷阱检测。
+
+        升级版 KEYWORD_COOC，利用「条件从句 + 负面主句」结构：
+          [如果不...] → [征信受损/涉嫌违法/拘留/影响子女]
+
+        降级策略：无依存句法时使用正则匹配条件从句模式。
+        """
+        condition_clauses: list[str] = rule.params.get("condition_clauses", [])
+        threat_clauses:   list[str] = rule.params.get("threat_clauses", [])
+        if not condition_clauses or not threat_clauses:
+            return
+
+        # 检测条件从句是否出现
+        has_condition = any(cond in text for cond in condition_clauses)
+        # 检测威胁主句是否出现
+        has_threat = any(threat in text for threat in threat_clauses)
+
+        # ── 依存句法增强：确认条件-威胁在同一小句范围内 ──
+        tokens: list[str]            = parsed.get("tokens", [])
+        dep:    list[tuple[int, str]] = parsed.get("dep", [])
+
+        syntactic_confirm = False
+        if dep and tokens and has_condition and has_threat:
+            # 在依存树中寻找「条件词 → 核心谓语」和「威胁词 → 核心谓语」
+            # 共享同一个 HED 时判定为同一小句
+            root_indices = [i for i, (_, rel) in enumerate(dep) if rel == "HED"]
+            for root_idx in root_indices:
+                children = [
+                    (i, tokens[i].lower(), rel)
+                    for i, (head, rel) in enumerate(dep)
+                    if head == root_idx
+                ]
+                child_texts = [t for _, t, _ in children]
+                # 检查这个谓语子树是否同时包含条件和威胁成分
+                has_cond_in_tree = any(c in " ".join(child_texts) for c in condition_clauses)
+                has_thrt_in_tree = any(t in " ".join(child_texts) for t in threat_clauses)
+                if has_cond_in_tree and has_thrt_in_tree:
+                    syntactic_confirm = True
+                    break
+
+        # 最终判定：关键词共现 OR 依存句法确认
+        if (has_condition and has_threat) or syntactic_confirm:
+            feats.set_feature(rule.feature_name, True)
+            hit_list = []
+            if has_condition:
+                hit_list.extend(c for c in condition_clauses if c in text)
+            if has_threat:
+                hit_list.extend(t for t in threat_clauses if t in text)
+            if rule.evidence_key and hit_list:
+                feats.add_evidence(rule.evidence_key, hit_list[:6])  # 最多保留 6 条证据
+
+    @staticmethod
+    def _extract_action_target_triplet(
+        text: str,
+        parsed: dict[str, Any],
+        rule: SyntaxRuleConfig,
+        feats: NlpFeatures,
+    ) -> None:
+        """
+        ACTION_TARGET_TRIPLET：语义角色三元组检测。
+
+        替代粗暴的 NER_DENSITY。关键不是「实体多」，而是「谁对实体做了什么」。
+        提取 [施事者: 你] + [动作: 转移/归集/下载/输入] + [受事者: 资金/屏幕/验证码]
+
+        降级策略：无依存句法时使用「动作动词 × 受事实体」关键词共现。
+        """
+        action_verbs:    list[str] = rule.params.get("action_verbs", [])
+        target_entities: list[str] = rule.params.get("target_entities", [])
+        if not action_verbs or not target_entities:
+            return
+
+        # 检测动作动词
+        hit_verbs = [v for v in action_verbs if v in text]
+        # 检测受事实体
+        hit_targets = [t for t in target_entities if t in text]
+
+        # ── 依存句法增强：确认「动词 VOB → 受事」结构 ──
+        tokens: list[str]            = parsed.get("tokens", [])
+        dep:    list[tuple[int, str]] = parsed.get("dep", [])
+
+        syntactic_confirm = False
+        if dep and tokens and hit_verbs and hit_targets:
+            # 在依存树中寻找「动作动词 → VOB → 受事实体」的三元组
+            for i, (head, rel) in enumerate(dep):
+                if rel != "VOB":
+                    continue
+                verb_idx = head
+                if verb_idx >= len(tokens):
+                    continue
+                verb_text = tokens[verb_idx]
+                obj_text  = tokens[i] if i < len(tokens) else ""
+                # 动词和宾语分别命中动作词库和受事词库
+                if verb_text in hit_verbs and obj_text in hit_targets:
+                    syntactic_confirm = True
+                    break
+
+        # 最终判定：关键词共现 AND（有依存确认 OR 动作词和受事词距离 < 10 字符）
+        if hit_verbs and hit_targets:
+            if syntactic_confirm:
+                feats.set_feature(rule.feature_name, True)
+            else:
+                # 降级：检查动作词和受事词是否在同一句话的邻近范围
+                for verb in hit_verbs:
+                    for target in hit_targets:
+                        v_pos = text.find(verb)
+                        t_pos = text.find(target)
+                        if v_pos >= 0 and t_pos >= 0 and abs(v_pos - t_pos) < 15:
+                            feats.set_feature(rule.feature_name, True)
+                            break
+                    if feats.get_feature(rule.feature_name):
+                        break
+
+        if feats.get_feature(rule.feature_name) and rule.evidence_key:
+            triplets = [f"{v}→{t}" for v in hit_verbs for t in hit_targets]
+            feats.add_evidence(rule.evidence_key, triplets[:6])
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

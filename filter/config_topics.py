@@ -79,6 +79,33 @@ class SyntaxRuleType(str, Enum):
     VERB_ENTITY_SPARSITY = "verb_entity_sparsity"
     # 实体与动词稀疏度检测
 
+    # ── V5.1 新增：行为学/心理学特征（对抗话术软化）───────────
+
+    ISOLATION_REQUEST = "isolation_request"
+    # 物理隔离与信息阻断检测
+    # 探测维度：空间隔离（找个没人的房间/把门反锁）、通讯阻断（不要挂电话/
+    #   开启飞行模式/拦截短信）、社交阻断（不能告诉家人/国家机密）
+    # params: isolation_keywords (list[str]) — 隔离/阻断指令词库
+    # 产出: feature_name → bool
+
+    MICRO_ACTION_COMMAND = "micro_action_command"
+    # 服从性测试与微动作指令检测
+    # 探测维度：手机设备控制（打开免提/点右上角/跟着我读）、屏幕操作引导
+    # params: device_action_keywords (list[str]) — 设备/操作微指令词库
+    # 产出: feature_name → bool
+
+    CONDITIONAL_THREAT = "conditional_threat"
+    # 条件胁迫与逻辑陷阱检测（升级 KEYWORD_COOC）
+    # 利用「条件从句 + 负面主句」结构：[如果不...] → [征信/违法/拘留]
+    # params: condition_clauses (list[str]), threat_clauses (list[str])
+    # 产出: feature_name → bool
+
+    ACTION_TARGET_TRIPLET = "action_target_triplet"
+    # 语义角色三元组检测（替代粗暴 NER_DENSITY）
+    # 提取 [施事者] + [动作: 转移/归集/下载] + [受事者: 资金/屏幕/验证码]
+    # params: action_verbs (list[str]), target_entities (list[str])
+    # 产出: feature_name → bool
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -148,11 +175,14 @@ class ScoringRules:
     standalone_tag      : 单项命中时添加的标签
     matrix_combinations : 矩阵组合列表；多个组合均触发时叠加计分
     whitelist_discount  : WHITELIST 类别专用，触发时整体折扣比例（0=全免，0.4=保留40%）
+    confidence_discount : 当矩阵触发的硬特征由 rule_based 后端产出时的衰减系数
+                          1.0 = 不衰减（有 NLP 支撑），0.5 = 折半（仅正则兜底）
     """
     standalone_score:    int                     = 0
     standalone_tag:      str                     = ""
     matrix_combinations: list[MatrixCombination] = field(default_factory=list)
     whitelist_discount:  float                   = 1.0  # 默认不折扣
+    confidence_discount: float                   = 0.5  # 默认折半（rule_based 无依存句法）
 
 
 @dataclass
@@ -259,11 +289,15 @@ _TOPIC_FRAUD_JARGON = TopicDefinition(
         bge_anchors=[],
     syntax_rules = [],  # 黑话本身即强信号，无需额外句法规则
     scoring_rules = ScoringRules(
-        standalone_score = 20,
+        standalone_score = 10,    # V5.1: 压低（原20），仅黑话最多爬到 60 分
         standalone_tag   = "has_fraud_jargon",
         matrix_combinations = [
-            MatrixCombination("has_imperative_syntax", 30, "fraud_imperative_jargon"),
-            MatrixCombination("high_entity_density",   18, "fraud_jargon_dense"),
+            MatrixCombination("has_imperative_syntax",          15, "fraud_imperative_jargon"),
+            MatrixCombination("high_entity_density",            10, "fraud_jargon_dense"),
+            MatrixCombination("has_isolation_request",          18, "fraud_jargon_isolation"),     # V5.1: 黑话+隔离=高危
+            MatrixCombination("has_micro_action_command",       12, "fraud_jargon_micro_cmd"),     # V5.1: 黑话+微动作
+            MatrixCombination("has_conditional_threat",         15, "fraud_jargon_threat"),        # V5.1: 黑话+胁迫
+            MatrixCombination("has_action_target_triplet",      18, "fraud_jargon_triplet"),       # V5.1: 黑话+三元组=高危
         ],
     ),
 )
@@ -297,14 +331,86 @@ _TOPIC_FRAUD_OBJECT = TopicDefinition(
                 "threshold":    3,
             },
         ),
+        # V5.1 新增：物理隔离与信息阻断（公检法诈骗绝对高危前置动作）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.ISOLATION_REQUEST,
+            feature_name = "has_isolation_request",
+            evidence_key = "isolation_evidence",
+            params = {
+                "isolation_keywords": [
+                    # 空间隔离
+                    "找个没人的地方", "找个没人的房间", "到外面去", "把门反锁",
+                    "反锁门", "关上门", "独自一人", "没有人的地方",
+                    # 通讯阻断
+                    "不要挂电话", "千万别挂", "不能挂断", "别挂",
+                    "开启飞行模式", "打开飞行模式", "关掉WiFi", "关掉 wifi",
+                    "拦截短信", "不要接电话", "不要回短信", "把手机静音",
+                    # 社交阻断
+                    "不能告诉家人", "不能告诉任何人", "这是国家机密",
+                    "保密", "不要跟别人说", "不要告诉朋友", "对谁都不能说",
+                    "你自己知道就好", "这件事不能让第三个人知道",
+                    # 英文隔离
+                    "don't tell anyone", "keep it secret", "go to a private room",
+                    "don't hang up", "turn off your phone",
+                ],
+            },
+        ),
+        # V5.1 新增：服从性测试微动作指令
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.MICRO_ACTION_COMMAND,
+            feature_name = "has_micro_action_command",
+            evidence_key = "micro_action_evidence",
+            params = {
+                "device_action_keywords": [
+                    # 手机设备操作
+                    "打开免提", "开免提", "点右上角", "点一下右上角",
+                    "点设置", "点击设置", "打开设置", "进入设置",
+                    "往下滑", "滑到底部", "点击链接", "点开链接",
+                    "扫码", "扫二维码", "截图", "截个屏", "录屏",
+                    # 行为控制测试
+                    "跟着我读", "你现在打开", "你点一下", "你按一下",
+                    "不要动手机", "手机放一边", "按照我说的做",
+                    "一步一步来", "你先", "然后", "再点",
+                    # 英文微指令
+                    "open your settings", "tap the icon", "click the link",
+                    "follow my instructions", "do exactly as I say",
+                ],
+            },
+        ),
+        # V5.1 新增：语义角色三元组（谁对实体做了什么）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.ACTION_TARGET_TRIPLET,
+            feature_name = "has_action_target_triplet",
+            evidence_key = "triplet_evidence",
+            params = {
+                "action_verbs": [
+                    "转账", "汇款", "打钱", "输入", "提供", "告知",
+                    "发送", "下载", "安装", "共享", "截图", "录屏",
+                    "归集", "转移", "提取", "验证", "确认", "授权",
+                    "tell me", "send me", "transfer", "share your",
+                    "download", "install", "verify",
+                ],
+                "target_entities": [
+                    "验证码", "密码", "短信", "屏幕", "账户", "银行卡",
+                    "身份证", "余额", "资金", "收款码", "付款码",
+                    "信用卡", "cvv", "otp", "one-time password",
+                    "screen", "password", "bank account", "credit card",
+                ],
+            },
+        ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 18,
+        standalone_score = 8,    # V5.1: 压低单项（原18），仅提敏感词最多爬到 58 分（关注区）
         standalone_tag   = "has_fraud_object",
         matrix_combinations = [
-            # 祈使句 × 诈骗客体 = 「你现在立刻把验证码发给我」→ 最高危
-            MatrixCombination("has_imperative_syntax", 45, "fraud_imperative_object"),
-            MatrixCombination("high_entity_density",   15, "fraud_object_dense"),
+            # 祈使句 × 诈骗客体 = 「你现在立刻把验证码发给我」→ 高危
+            MatrixCombination("has_imperative_syntax",       20, "fraud_imperative_object"),
+            MatrixCombination("high_entity_density",          8, "fraud_object_dense"),
+            # V5.1 新增矩阵：行为学特征 × 诈骗客体
+            MatrixCombination("has_isolation_request",       22, "fraud_isolation_object"),      # 隔离+客体=极高危
+            MatrixCombination("has_micro_action_command",    18, "fraud_micro_cmd_object"),       # 微动作+客体=高危
+            MatrixCombination("has_action_target_triplet",   20, "fraud_triplet_object"),         # 三元组+客体=高危
+            MatrixCombination("has_conditional_threat",      18, "fraud_conditional_threat"),     # 条件胁迫+客体=高危
         ],
     ),
 )
@@ -316,7 +422,6 @@ _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
     threshold   = 0.72,
         bge_anchors=[],
     syntax_rules = [
-        # 复用 has_imperative_syntax 和 high_entity_density（与 fraud_object 共享规则）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.IMPERATIVE_SYNTAX,
             feature_name = "has_imperative_syntax",
@@ -339,13 +444,38 @@ _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
                 "threshold":    3,
             },
         ),
+        # V5.1: 条件胁迫（公检法诈骗核心：不配合→拘留/征信）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.CONDITIONAL_THREAT,
+            feature_name = "has_conditional_threat",
+            evidence_key = "conditional_threat_evidence",
+            params = {
+                "condition_clauses": [
+                    "如果不", "如果不配合", "如果不处理", "如果不转账",
+                    "如果你不", "要是你不", "不配合的话", "不处理的话",
+                    "否则", "一旦", "要是", "假如不",
+                    "if you don't", "otherwise", "if not",
+                ],
+                "threat_clauses": [
+                    "征信", "征信受损", "信用记录", "影响征信",
+                    "涉嫌", "涉嫌违法", "涉嫌犯罪", "涉嫌洗钱",
+                    "拘留", "逮捕", "判刑", "坐牢", "通缉",
+                    "冻结", "冻结账户", "冻结资产", "封号",
+                    "后果", "法律责任", "承担后果",
+                    "影响子女", "影响家人", "牵连",
+                    "criminal", "arrest", "frozen", "credit score",
+                ],
+            },
+        ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 22,
+        standalone_score = 10,    # V5.1: 压低单项（原22）
         standalone_tag   = "has_authority_entity",
         matrix_combinations = [
-            MatrixCombination("has_imperative_syntax", 35, "fraud_authority_pressure"),
-            MatrixCombination("high_entity_density",   28, "fraud_authority_entity_dense"),
+            MatrixCombination("has_imperative_syntax",      18, "fraud_authority_pressure"),
+            MatrixCombination("high_entity_density",        12, "fraud_authority_entity_dense"),
+            MatrixCombination("has_isolation_request",      22, "authority_isolation_extreme"),    # V5.1: 隔离+权威=极危
+            MatrixCombination("has_conditional_threat",     25, "authority_conditional_coercion"),  # V5.1: 条件胁迫+权威=极高危
         ],
     ),
 )
@@ -375,12 +505,11 @@ _TOPIC_DRUG_JARGON = TopicDefinition(
         ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 22,
+        standalone_score = 10,    # V5.1: 压低（原22）
         standalone_tag   = "has_drug_jargon",
         matrix_combinations = [
-            # 数量 × 毒品隐语 = 「5克白的」→ 极高危
-            MatrixCombination("has_drug_quantity", 50, "drug_quantity_jargon"),
-            MatrixCombination("high_entity_density", 20, "drug_jargon_dense"),
+            MatrixCombination("has_drug_quantity", 25, "drug_quantity_jargon"),     # V5.1: 压低（原50）
+            MatrixCombination("high_entity_density", 10, "drug_jargon_dense"),      # V5.1: 压低（原20）
         ],
     ),
 )
@@ -405,11 +534,11 @@ _TOPIC_DRUG_CHAIN = TopicDefinition(
         ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 15,
+        standalone_score = 8,     # V5.1: 压低（原15）
         standalone_tag   = "has_drug_chain",
         matrix_combinations = [
-            MatrixCombination("has_drug_quantity",   35, "drug_quantity_chain"),
-            MatrixCombination("high_entity_density", 12, "drug_chain_dense"),
+            MatrixCombination("has_drug_quantity",   18, "drug_quantity_chain"),    # V5.1: 压低（原35）
+            MatrixCombination("high_entity_density",  8, "drug_chain_dense"),        # V5.1: 压低（原12）
         ],
     ),
 )
@@ -479,12 +608,13 @@ _TOPIC_COERCIVE_ORG_CONTROL = TopicDefinition(
         ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 28,
+        standalone_score = 12,    # V5.1: 压低（原28）
         standalone_tag   = "coercive_org_behavior",
         matrix_combinations = [
-            # 金融勒索 × 软意图强化 = 极高危
-            MatrixCombination("has_coercive_financial_demand", 40, "critical_coercive_financial"),
-            MatrixCombination("has_exit_threat",               30, "critical_exit_coercion"),
+            MatrixCombination("has_coercive_financial_demand", 20, "critical_coercive_financial"),   # V5.1: 压低（原40）
+            MatrixCombination("has_exit_threat",               15, "critical_exit_coercion"),        # V5.1: 压低（原30）
+            MatrixCombination("has_isolation_request",         18, "coercive_isolation_extreme"),    # V5.1: 隔离+强制控制=极危
+            MatrixCombination("has_conditional_threat",        18, "coercive_conditional_threat"),   # V5.1: 条件胁迫+强制控制
         ],
     ),
 )
@@ -505,10 +635,10 @@ _TOPIC_EXTREMIST_PROPAGANDA = TopicDefinition(
         bge_anchors=[],
     syntax_rules = [],
     scoring_rules = ScoringRules(
-        standalone_score = 40,
+        standalone_score = 15,    # V5.1: 压低（原40）
         standalone_tag   = "extremist_propaganda",
         matrix_combinations = [
-            MatrixCombination("high_entity_density", 10, "extremist_with_dense_entities"),
+            MatrixCombination("high_entity_density", 8, "extremist_with_dense_entities"),  # V5.1: 压低（原10）
         ],
     ),
 )
@@ -557,10 +687,10 @@ _TOPIC_INCITEMENT_TO_VIOLENCE = TopicDefinition(
         bge_anchors=[],
     syntax_rules = [],
     scoring_rules = ScoringRules(
-        standalone_score = 40,
+        standalone_score = 15,    # V5.1: 压低（原40）
         standalone_tag   = "incitement_to_violence",
         matrix_combinations = [
-            MatrixCombination("high_entity_density", 10, "violence_with_dense_entities"),
+            MatrixCombination("high_entity_density", 8, "violence_with_dense_entities"),  # V5.1: 压低（原10）
         ],
     ),
 )
@@ -691,7 +821,7 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
     threshold   = 0.72,
     bge_anchors=[],
     syntax_rules = [
-        # 👇 补上这个专门针对微保/百万保障诈骗的核爆级硬探针
+        # 微保/百万保障诈骗核爆级硬探针
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.REGEX_PATTERN,
             feature_name = "has_insurance_scam_keywords",
@@ -706,17 +836,62 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
             params       = {
                 "pattern": r"(备用金|白条|金条|借呗|微粒贷).{0,30}(额度|关闭|激活|服务费|违约金|征信)|(点击|打开).{0,10}(链接|网址|屏幕共享)|(京东|金融|淘宝|客服).{0,20}(注销|额度|回执)"
             }
-        )
+        ),
+        # V5.1 新增：服从性测试微动作指令（电商客服特供）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.MICRO_ACTION_COMMAND,
+            feature_name = "has_ecommerce_micro_cmd",
+            evidence_key = "ecommerce_micro_cmd_evidence",
+            params = {
+                "device_action_keywords": [
+                    # 屏幕操作
+                    "打开微信", "打开支付宝", "打开手机银行",
+                    "点右上角", "点我的", "点设置", "点击服务",
+                    "进入钱包", "进入支付", "往下滑",
+                    "点击链接", "扫码", "截个屏", "录屏",
+                    "共享屏幕", "屏幕共享",
+                    # 引导下载
+                    "下载APP", "安装软件", "打开这个APP",
+                    # 引导输入
+                    "输入验证码", "告诉我验证码", "念一下验证码",
+                    "把密码输入", "输入支付密码",
+                    # 英文版电商引导
+                    "open the app", "go to settings", "share your screen",
+                ],
+            },
+        ),
+        # V5.1 新增：条件胁迫（「不关闭百万保障会扣费」）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.CONDITIONAL_THREAT,
+            feature_name = "has_ecommerce_conditional_threat",
+            evidence_key = "ecommerce_threat_evidence",
+            params = {
+                "condition_clauses": [
+                    "如果不", "如果不关闭", "不处理的话", "不取消",
+                    "不及时", "逾期", "今天不",
+                    "if you don't", "unless you",
+                ],
+                "threat_clauses": [
+                    "扣费", "收费", "自动续费", "每月扣",
+                    "影响征信", "征信", "信用",
+                    "冻结", "封号", "限制", "无法使用",
+                    "charged", "fee", "freeze",
+                ],
+            },
+        ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 15,
+        standalone_score = 8,     # V5.1: 压低（原15）
         standalone_tag   = "suspicious_fake_cs",
         matrix_combinations = [
-            MatrixCombination("has_fraud_object", 45, "fake_cs_screen_share_trap"),
-            MatrixCombination("has_coercive_threat", 40, "fake_cs_financial_threat"),
-            # 独立触发
-            MatrixCombination("has_insurance_scam_keywords", 50, "critical_insurance_scam", is_independent=True),
-            MatrixCombination("has_financial_scam_keywords", 50, "critical_financial_scam", is_independent=True),
+            MatrixCombination("has_fraud_object",                 20, "fake_cs_screen_share_trap"),
+            MatrixCombination("has_coercive_threat",              18, "fake_cs_financial_threat"),
+            MatrixCombination("has_ecommerce_micro_cmd",          20, "fake_cs_micro_cmd_trap"),       # V5.1
+            MatrixCombination("has_ecommerce_conditional_threat", 20, "fake_cs_conditional_trap"),      # V5.1
+            MatrixCombination("has_isolation_request",            22, "fake_cs_isolation_trap"),         # V5.1
+            # 独立触发（正则硬探针保留高权重）
+            MatrixCombination("has_insurance_scam_keywords",      30, "critical_insurance_scam", is_independent=True),
+            MatrixCombination("has_financial_scam_keywords",      30, "critical_financial_scam", is_independent=True),
         ],
     ),
 )
@@ -728,11 +903,11 @@ _TOPIC_MASS_GRIEVANCE = TopicDefinition(
     threshold   = 0.68,
         bge_anchors=[],
     scoring_rules = ScoringRules(
-        standalone_score = 25,
+        standalone_score = 12,    # V5.1: 压低（原25）
         standalone_tag   = "social_grievance_petition",
         matrix_combinations = [
-            MatrixCombination("coordinated_broadcast", 40, "CRITICAL_MASS_INCIDENT_MOBILIZATION"),
-            MatrixCombination("incitement_to_violence", 40, "CRITICAL_VIOLENT_PROTEST_RISK"),
+            MatrixCombination("coordinated_broadcast",  20, "CRITICAL_MASS_INCIDENT_MOBILIZATION"),   # V5.1: 压低（原40）
+            MatrixCombination("incitement_to_violence", 20, "CRITICAL_VIOLENT_PROTEST_RISK"),          # V5.1: 压低（原40）
         ],
     ),
 )
@@ -797,7 +972,7 @@ _TOPIC_INDUSTRIAL_REPORT = TopicDefinition(
         bge_anchors=[],
     syntax_rules  = [],
     scoring_rules = ScoringRules(
-        standalone_score = -5,    # 微降权，保留可能含实质内容的工业对话
+        standalone_score = -15,   # V5.1: 加大扣分（原-5），50-15=35
         standalone_tag   = "low_value_industrial_noise",
     ),
 )
@@ -815,11 +990,11 @@ _TOPIC_CASUAL_CHAT = TopicDefinition(
         bge_anchors=[],
     syntax_rules  = [],
     scoring_rules = ScoringRules(
-            standalone_score = -3,   # 微降权（原 -10）
+            standalone_score = -20,  # V5.1: 大幅扣分（原-3），50-20=30（安全/废料区）
             standalone_tag   = "low_value_casual_chat",
             matrix_combinations = [
-                # 闲聊且没有业务名词，双重确认是废话，狠狠打入深渊
-                MatrixCombination("is_business_sparse", -20, "casual_chat_extremely_sparse"),
+                # 闲聊且没有业务名词，双重确认是废话，打入深渊
+                MatrixCombination("is_business_sparse", -15, "casual_chat_extremely_sparse"),  # V5.1: 总计-35
             ]
         ),
 )
