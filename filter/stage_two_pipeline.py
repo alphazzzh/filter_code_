@@ -99,26 +99,8 @@ def _build_org_suffix_pattern() -> re.Pattern:
     )
 
 
-# 在模块加载时，扫描 config 中所有 QUANTITY_REGEX 规则，预编译正则
-_COMPILED_QUANTITY_PATTERNS: dict[str, re.Pattern] = {}
-_COMPILED_REGEX_PATTERNS:    dict[str, re.Pattern] = {}
-_RE_ORG_SUFFIX:              re.Pattern            = _build_org_suffix_pattern()
-
-for _rule in get_all_syntax_rules().values():
-    if _rule.rule_type == SyntaxRuleType.QUANTITY_REGEX:
-        _units = _rule.params.get("quantity_units", [])
-        if _units:
-            _COMPILED_QUANTITY_PATTERNS[_rule.feature_name] = (
-                _build_quantity_pattern(_units)
-            )
-    elif _rule.rule_type == SyntaxRuleType.REGEX_PATTERN:
-        _pattern_str = _rule.params.get("pattern", "")
-        if _pattern_str:
-            _flags_str  = _rule.params.get("flags", "UNICODE")
-            _flags      = getattr(re, _flags_str, re.UNICODE)
-            _COMPILED_REGEX_PATTERNS[_rule.feature_name] = re.compile(
-                _pattern_str, _flags
-            )
+# 模块级常量：NER 降级兜底的机构名尾缀正则（无状态，不随配置变化）
+_RE_ORG_SUFFIX: re.Pattern = _build_org_suffix_pattern()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -282,6 +264,38 @@ class SyntaxFeatureExtractor:
         self._backend: _NlpBackend             = backend or _load_nlp_backend()
         # 从配置加载所有去重后的句法规则（feature_name → SyntaxRuleConfig）
         self._rules:  dict[str, SyntaxRuleConfig] = get_all_syntax_rules()
+        # 实例级预编译正则缓存（支持热更新）
+        self._compiled_quantity_patterns: dict[str, re.Pattern] = {}
+        self._compiled_regex_patterns:    dict[str, re.Pattern] = {}
+        self._compile_patterns()
+
+    def _compile_patterns(self) -> None:
+        """扫描当前 self._rules，预编译所有 QUANTITY_REGEX / REGEX_PATTERN 正则。"""
+        self._compiled_quantity_patterns.clear()
+        self._compiled_regex_patterns.clear()
+        for _rule in self._rules.values():
+            if _rule.rule_type == SyntaxRuleType.QUANTITY_REGEX:
+                _units = _rule.params.get("quantity_units", [])
+                if _units:
+                    self._compiled_quantity_patterns[_rule.feature_name] = (
+                        _build_quantity_pattern(_units)
+                    )
+            elif _rule.rule_type == SyntaxRuleType.REGEX_PATTERN:
+                _pattern_str = _rule.params.get("pattern", "")
+                if _pattern_str:
+                    _flags_str = _rule.params.get("flags", "UNICODE")
+                    _flags     = getattr(re, _flags_str, re.UNICODE)
+                    self._compiled_regex_patterns[_rule.feature_name] = re.compile(
+                        _pattern_str, _flags
+                    )
+
+    def reload(self) -> None:
+        """
+        热更新：重新从 config_topics 加载规则并重建正则缓存。
+        调用此方法后，后续的 extract() 将使用最新配置。
+        """
+        self._rules = get_all_syntax_rules()
+        self._compile_patterns()
 
     def extract(self, text: str) -> NlpFeatures:
         """
@@ -346,15 +360,14 @@ class SyntaxFeatureExtractor:
 
     # ── 各类型提取器 ──────────────────────────────────────────
 
-    @staticmethod
     def _extract_quantity_regex(
-        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+        self, text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
         """
         QUANTITY_REGEX：数字 + 量词正则匹配。
-        使用模块加载时预编译的缓存正则，零运行时开销。
+        使用实例级预编译缓存正则，支持热更新。
         """
-        pattern = _COMPILED_QUANTITY_PATTERNS.get(rule.feature_name)
+        pattern = self._compiled_quantity_patterns.get(rule.feature_name)
         if pattern is None:
             return
         matches = pattern.findall(text)
@@ -366,12 +379,11 @@ class SyntaxFeatureExtractor:
                     [f"{num}{unit}" for num, unit in matches],
                 )
 
-    @staticmethod
     def _extract_regex_pattern(
-        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+        self, text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
-        """REGEX_PATTERN：自定义正则，使用预编译缓存。"""
-        pattern = _COMPILED_REGEX_PATTERNS.get(rule.feature_name)
+        """REGEX_PATTERN：自定义正则，使用实例级预编译缓存。"""
+        pattern = self._compiled_regex_patterns.get(rule.feature_name)
         if pattern is None:
             return
         found = pattern.findall(text)
@@ -638,54 +650,62 @@ class SyntaxFeatureExtractor:
         rule: SyntaxRuleConfig,
         feats: NlpFeatures,
     ) -> None:
-        """
-        ACTION_TARGET_TRIPLET：语义角色三元组检测。
-
-        替代粗暴的 NER_DENSITY。关键不是「实体多」，而是「谁对实体做了什么」。
-        提取 [施事者: 你] + [动作: 转移/归集/下载/输入] + [受事者: 资金/屏幕/验证码]
-
-        降级策略：无依存句法时使用「动作动词 × 受事实体」关键词共现。
-        """
         action_verbs:    list[str] = rule.params.get("action_verbs", [])
         target_entities: list[str] = rule.params.get("target_entities", [])
         if not action_verbs or not target_entities:
             return
 
-        # 检测动作动词
         hit_verbs = [v for v in action_verbs if v in text]
-        # 检测受事实体
         hit_targets = [t for t in target_entities if t in text]
 
-        # ── 依存句法增强：确认「动词 VOB → 受事」结构 ──
+        # ── 依存句法增强：兼容 VOB, FOB 以及“把”字句(POB) ──
         tokens: list[str]            = parsed.get("tokens", [])
         dep:    list[tuple[int, str]] = parsed.get("dep", [])
 
         syntactic_confirm = False
         if dep and tokens and hit_verbs and hit_targets:
-            # 在依存树中寻找「动作动词 → VOB → 受事实体」的三元组
+            
+            # 遍历所有节点 (i为子节点索引, head为父节点索引, rel为关系)
             for i, (head, rel) in enumerate(dep):
-                if rel != "VOB":
+                if head >= len(tokens): 
                     continue
-                verb_idx = head
-                if verb_idx >= len(tokens):
-                    continue
-                verb_text = tokens[verb_idx]
-                obj_text  = tokens[i] if i < len(tokens) else ""
-                # 动词和宾语分别命中动作词库和受事词库
-                if verb_text in hit_verbs and obj_text in hit_targets:
-                    syntactic_confirm = True
-                    break
+                    
+                child_text = tokens[i]
+                head_text  = tokens[head]
 
-        # 最终判定：关键词共现 AND（有依存确认 OR 动作词和受事词距离 < 10 字符）
+                # 🎯 场景 1 & 2：直接宾语 (VOB) 或 前置宾语 (FOB)
+                # 例如：“输入(head) 验证码(child)” 或 “验证码(child) 输入(head)了吗”
+                if rel in ("VOB", "FOB"):
+                    if head_text in hit_verbs and child_text in hit_targets:
+                        syntactic_confirm = True
+                        break
+
+                # 🎯 场景 3：“把”字句 / 介词宾语结构 (POB 向上追溯 ADV)
+                # 例如：“把(head) 验证码(child) 发(prep_head) 给我”
+                if rel == "POB":
+                    # 如果当前词是目标实体（如验证码），且它的父节点是“把”或“将”
+                    if child_text in hit_targets and head_text in ("把", "将", "给"):
+                        # 向上追溯第二跳：找到“把”依附的核心动词
+                        prep_head_idx = dep[head][0] # “把”的父节点索引
+                        prep_rel      = dep[head][1] # “把”与父节点的关系
+                        
+                        if prep_head_idx < len(tokens):
+                            prep_head_text = tokens[prep_head_idx]
+                            # 如果“把”是作为状语(ADV)依附在我们的高危动作词上(如"发")
+                            if prep_rel == "ADV" and prep_head_text in hit_verbs:
+                                syntactic_confirm = True
+                                break
+
+        # ── 降级判定与证据组装（保持不变） ──
         if hit_verbs and hit_targets:
             if syntactic_confirm:
                 feats.set_feature(rule.feature_name, True)
             else:
-                # 降级：检查动作词和受事词是否在同一句话的邻近范围
                 for verb in hit_verbs:
                     for target in hit_targets:
                         v_pos = text.find(verb)
                         t_pos = text.find(target)
+                        # 降级：如果在 15 个字符内共现，也算命中
                         if v_pos >= 0 and t_pos >= 0 and abs(v_pos - t_pos) < 15:
                             feats.set_feature(rule.feature_name, True)
                             break

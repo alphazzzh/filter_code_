@@ -138,6 +138,7 @@ class IntentRadar:
 
     _instance: ClassVar[Optional["IntentRadar"]] = None
     _lock:     ClassVar[threading.Lock]          = threading.Lock()
+    _reload_lock: ClassVar[threading.Lock]       = threading.Lock()
 
     def __init__(
         self,
@@ -147,6 +148,7 @@ class IntentRadar:
         registry:    dict[str, TopicDefinition] = TOPIC_REGISTRY,
     ) -> None:
         self._batch_size = batch_size
+        self._registry   = registry  # 保存注册表引用，供 reload() 使用
 
         # ── 模型加载 ──────────────────────────────────────────
         if _BGEM3_AVAILABLE and BGEM3FlagModel is not None:
@@ -189,6 +191,30 @@ class IntentRadar:
                         use_fp16   = use_fp16,
                     )
         return cls._instance
+
+    # ── 热更新 ──────────────────────────────────────────────
+
+    def reload(self, registry: dict[str, TopicDefinition] | None = None) -> None:
+        """
+        热更新：全量重建锚点矩阵和阈值映射。
+
+        当配置发生变更（如新增/删除主题、修改 bge_anchors 或 threshold）
+        时调用此方法。使用互斥锁保证线程安全——在重建期间，
+        并发的 detect_batch 调用会等待完成后再读取新矩阵。
+
+        Parameters
+        ----------
+        registry : 新的注册表。若为 None 则使用初始化时的注册表。
+        """
+        new_registry = registry if registry is not None else self._registry
+        with self._reload_lock:
+            self._registry = new_registry
+            self._threshold_map = {
+                tid: td.threshold
+                for tid, td in new_registry.items()
+            }
+            self._anchor_matrices.clear()
+            self._vectorize_from_registry(new_registry)
 
     # ── 离线向量化 ────────────────────────────────────────────
 

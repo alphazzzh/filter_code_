@@ -107,7 +107,6 @@ class _ScoringContext:
     score:  int                  = _BASE_SCORE
     tags:   set[str]             = field(default_factory=set)
     events: list[dict[str, Any]] = field(default_factory=list)
-    global_confidence_discount: float = 1.0  # 受害者抵抗引起的全局风险分乘法衰减系数
 
     def apply(self, delta: int, tag: str | None, reason: str) -> None:
         self.score += delta
@@ -368,25 +367,14 @@ class IntelligenceScorer:
                   条件：该主题意图被命中 AND 对应硬特征为 True
           Step C：记录该主题是否有任何命中（供跨主题复合加分计数）
 
-        V5.1 新增：置信度衰减（Confidence Discount）
-          - 从 nlp_features 中读取 nlp_backend 字段
-          - 当 nlp_backend == "rule_based" 时，矩阵加分按 confidence_discount 衰减
-          - 仅正则/关键词匹配的得分打折，有 NLP 依存句法支撑的得分不打折
-
         返回：命中（触发过分值变化）的主题数量
         """
         hit_count = 0
-
-        # ── 置信度衰减因子 ──
-        nlp_backend: str = agent_nlp_feats.get("nlp_backend", "unknown")
 
         for topic_id, topic_def in self._high_risk_topics.items():
             has_soft_intent = topic_id in all_intents
             topic_hit = False
             matrix_hit = False
-
-            # 置信度折扣：rule_based 后端产出 → 折扣衰减
-            cd = topic_def.scoring_rules.confidence_discount if nlp_backend == "rule_based" else 1.0
 
             # Step B：矩阵组合扫描 (优先判断矩阵，不再提前 continue)
             for combo in topic_def.scoring_rules.matrix_combinations:
@@ -403,23 +391,13 @@ class IntelligenceScorer:
                     triggered = True  
 
                 if triggered:
-                    raw_delta = combo.bonus_score
-                    # ── 置信度衰减 ──
-                    # is_independent 的硬探针（如 REGEX_PATTERN）不打折，
-                    # 因为它们本身就是高精确率的独立信号
-                    if combo.is_independent:
-                        effective_delta = raw_delta
-                    else:
-                        effective_delta = int(raw_delta * cd)
-
                     ctx.apply(
-                        delta  = effective_delta,
+                        delta  = combo.bonus_score,
                         tag    = combo.bonus_tag,
                         reason = (
                             f"矩阵命中 [{'!' if combo.requires_absence else ''}{combo.syntax_feature}] "
                             f"{'(独立触发)' if combo.is_independent else '× [' + topic_id + ']'} "
-                            f"→ {raw_delta:+d}"
-                            + (f" (衰减×{cd:.1f}={effective_delta:+d})" if cd < 1.0 and not combo.is_independent else "")
+                            f"→ {combo.bonus_score:+d}"
                         ),
                     )
                     matrix_hit = True
@@ -440,25 +418,8 @@ class IntelligenceScorer:
         return hit_count
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Target Resistance Discount (Task 3) — V5.1 阶梯折扣
+    # Target Resistance Discount (Task 3)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    # 阶梯抵抗折扣水位线
-    _RESISTANCE_TIER1_RATE: float = 0.15    # 轻度抵抗：>15% 轮次抵抗
-    _RESISTANCE_TIER1_DELTA: int   = -15    # 轻度折扣
-    _RESISTANCE_TIER1_TAG:   str   = "fraud_target_mild_resistance"
-
-    _RESISTANCE_TIER2_RATE: float = 0.30    # 中度抵抗：>30% 轮次抵抗
-    _RESISTANCE_TIER2_DELTA: int   = -25    # 中度折扣
-    _RESISTANCE_TIER2_TAG:   str   = "fraud_target_moderate_resistance"
-
-    _RESISTANCE_TIER3_RATE: float = 0.50    # 重度抵抗：>50% 轮次抵抗
-    _RESISTANCE_TIER3_DELTA: int   = -40    # 重度折扣（封顶）
-    _RESISTANCE_TIER3_TAG:   str   = "fraud_target_heavy_resistance"
-
-    # 阻断判定条件：绝对识破（dismissal 意图存在）+ 顺从度极低
-    _RESISTANCE_ABSOLUTE_DISMISSAL: float = 0.10  # 顺从率低于此值视为零顺从
-
     def _run_target_resistance_discount(
             self,
             ctx:         _ScoringContext,
@@ -466,23 +427,15 @@ class IntelligenceScorer:
             has_high_risk: bool,
         ) -> None:
             """
-            V5.1 阶梯受害者抵抗降权机制：
-            
-            分三层水位线检测，根据抵抗率选择对应折扣档位：
-              Tier 1（轻度）：resistance_rate > 0.15 → -15 分
-              Tier 2（中度）：resistance_rate > 0.30 → -25 分  
-              Tier 3（重度）：resistance_rate > 0.50 → -40 分（封顶）
-            
-            绝对抗破条件（跳过阶梯，直接 Tier 3）：
-              - 存在 dismissal（识破）意图 AND compliance_rate < 0.10
-              - 直接标记为「诈骗未遂」scam_attempt_rejected
-            
-            无论哪个档位命中，均追加 fraud_attempt_rejected 状态标签。
+            全局受害者抵抗降权机制（已修复平权聊天盲区与类型错误）：
+            如果高危对话中潜在受害者明确拒绝/抵抗且顺从度极低，则视为失败的犯罪尝试，大幅扣分。
+            同时追加「诈骗未遂」状态标签（scam_attempt_rejected），具有极高情报价值。
             """
             if not has_high_risk:
                 return
 
-            # 提取所有非 AGENT 角色作为潜在受害者
+            # 👇 核心修复：result.speaker_roles 是 list[SpeakerRoleResult]
+            # 遍历对象列表，只要角色的 role 属性不是 AGENT，就提取他的 speaker_id
             potential_resisters = [
                 sr.speaker_id for sr in result.speaker_roles
                 if sr.role != RoleLabel.AGENT
@@ -491,12 +444,7 @@ class IntelligenceScorer:
             if not potential_resisters:
                 return
 
-            # 遍历所有潜在受害者，取抵抗最强者的档位
-            best_tier_delta = 0
-            best_tier_tag = ""
-            best_discount_factor = 1.0  # 对应的乘法衰减系数
-            absolute_rejection = False
-
+            # 遍历所有潜在受害者，只要有一人成功抵抗，即可触发降权
             for target_sid in potential_resisters:
                 target_turns = [
                     t for t in result.dialogue_turns
@@ -505,6 +453,7 @@ class IntelligenceScorer:
                 if not target_turns:
                     continue
 
+                # 收集该受害者的所有意图，方便快速判断是否包含绝对的质变信号
                 target_intents = {label for t in target_turns for label in t.intent_labels}
 
                 resistance_intents = {"dismissal", "rejection"}
@@ -518,56 +467,21 @@ class IntelligenceScorer:
                 )
                 compliance_rate = compliance_count / len(target_turns)
 
-                # 绝对抗破判定（跳过阶梯，直接进入最重档位）
-                if "dismissal" in target_intents and compliance_rate < self._RESISTANCE_ABSOLUTE_DISMISSAL:
-                    absolute_rejection = True
-                    best_tier_delta = self._RESISTANCE_TIER3_DELTA
-                    best_tier_tag = self._RESISTANCE_TIER3_TAG
-                    best_discount_factor = 0.4  # Tier 3 / 绝对识破 → 重度衰减
-                    break
-
-                # 阶梯判定（取最重的档位）
-                if resistance_rate > self._RESISTANCE_TIER3_RATE:
-                    tier_delta = self._RESISTANCE_TIER3_DELTA
-                    tier_tag = self._RESISTANCE_TIER3_TAG
-                    tier_discount = 0.4  # Tier 3 → 重度衰减
-                elif resistance_rate > self._RESISTANCE_TIER2_RATE:
-                    tier_delta = self._RESISTANCE_TIER2_DELTA
-                    tier_tag = self._RESISTANCE_TIER2_TAG
-                    tier_discount = 0.6  # Tier 2 → 中度衰减
-                elif resistance_rate > self._RESISTANCE_TIER1_RATE:
-                    tier_delta = self._RESISTANCE_TIER1_DELTA
-                    tier_tag = self._RESISTANCE_TIER1_TAG
-                    tier_discount = 0.8  # Tier 1 → 轻度衰减
-                else:
-                    continue
-
-                # 取最重档位（delta 绝对值更大，discount_factor 更小）
-                if abs(tier_delta) > abs(best_tier_delta):
-                    best_tier_delta = tier_delta
-                    best_tier_tag = tier_tag
-                    best_discount_factor = tier_discount
-
-            if best_tier_delta == 0:
-                return
-
-            # 应用折扣
-            ctx.apply(
-                delta  = best_tier_delta,
-                tag    = best_tier_tag,
-                reason = (
-                    f"检测到高危风险，但疑似受害者明确抵抗"
-                    f"{'（绝对识破dismissal）' if absolute_rejection else ''}"
-                    f"，案件降级为未遂线索"
-                ),
-            )
-            # 追加「诈骗未遂」状态标签——情报分析的核心信号
-            ctx.tags.add(_SCAM_ATTEMPT_REJECTED_TAG)
-
-            # 设置全局乘法衰减系数（取最小值以保留最强抵抗效果）
-            ctx.global_confidence_discount = min(
-                ctx.global_confidence_discount, best_discount_factor
-            )
+                # 🚨 终极微调：抵抗率 > 0.25 (量变) 或者 明确识破(质变)
+                if (resistance_rate > 0.25 or "dismissal" in target_intents) and compliance_rate < 0.10:
+                    ctx.apply(
+                        delta  = -35,
+                        tag    = "fraud_failed_target_resisted",
+                        reason = (
+                            f"检测到高危风险，但疑似受害者({target_sid})明确拒绝/脱战"
+                            f"（抵抗率={resistance_rate:.2f}或触发绝对识破），案件降级为未遂线索"
+                        ),
+                    )
+                    # 追加「诈骗未遂」状态标签——情报分析的核心信号
+                    ctx.tags.add(_SCAM_ATTEMPT_REJECTED_TAG)
+                    
+                    # 只要有一方成功抵抗，即刻生效并退出
+                    return
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # LOW_VALUE_NOISE 降权扣分
@@ -652,7 +566,6 @@ class IntelligenceScorer:
                 
                 # 如果校验通过且不存在句法拦截，正常应用白名单减分及折扣
                 if is_wl:
-                    # 👇 修复：绝不能把白名单自己的负分打折！直接使用原汁原味的负分进行核减
                     ctx.apply(
                         delta  = td.scoring_rules.standalone_score,
                         tag    = td.scoring_rules.standalone_tag,
@@ -927,22 +840,7 @@ class IntelligenceScorer:
         # 👇 修改：如果存在超级白名单豁免，直接撤销高危底线锁，允许分数下探到安全区
         floor_score = IntelligenceScorer._HIGH_RISK_FLOOR if (has_high_risk and not is_whitelisted) else _SCORE_MIN
 
-        # ── V5.1 全局受害者抵抗乘法衰减 ──
-        # 在 floor_score 钳位之前，对超出基准分的风险净值进行乘法衰减
-        adjusted_score = ctx.score
-        risk_score = ctx.score - _BASE_SCORE
-        if risk_score > 0 and ctx.global_confidence_discount < 1.0:
-            original_risk = risk_score
-            risk_score = int(risk_score * ctx.global_confidence_discount)
-            # 记录衰减事件用于审计
-            ctx.events.append({
-                "delta": risk_score - original_risk,
-                "tag": "global_resistance_discount_applied",
-                "reason": f"由于受害者抵抗，全局风险分进行乘法衰减 (系数 {ctx.global_confidence_discount})"
-            })
-            adjusted_score = _BASE_SCORE + risk_score
-
-        final_score = max(floor_score, min(_SCORE_MAX, adjusted_score))
+        final_score = max(floor_score, min(_SCORE_MAX, ctx.score))
 
         # ── 标签降维压制（Hierarchical Tag Suppression）──
         # 在输出前执行：高危意图存在时，清除底层噪音标签，防止语义冲突
@@ -957,12 +855,7 @@ class IntelligenceScorer:
             k: v for k, v in nlp_feats.items()
             if isinstance(v, bool)
         }
-        nlp_backend = nlp_feats.get("nlp_backend", "unknown")
-        nlp_bool_summary["nlp_backend"] = nlp_backend
-
-        # ── 置信度衰减审计信息 ──
-        # 检查是否存在被打折的事件，如果有则标记 confidence_discounted=True
-        has_discounted = any("衰减" in e.get("reason", "") for e in ctx.events)
+        nlp_bool_summary["nlp_backend"] = nlp_feats.get("nlp_backend", "unknown")
 
         ifeats = result.interaction_features
 
@@ -984,8 +877,6 @@ class IntelligenceScorer:
                 {"delta": e["delta"], "tag": e["tag"], "reason": e["reason"]}
                 for e in ctx.events
             ],
-            # ── V5.1 新增审计字段 ──
-            "confidence_discounted": has_discounted,  # 是否存在置信度衰减（rule_based 后端）
         }
 
         # 透传阶段二动态检索结果（dynamic_topic → BGE 矩阵相似度 → dynamic_search）
