@@ -1,4 +1,4 @@
-# stage_three_scorer.py  ── V5.0 配置驱动版
+# stage_three_scorer.py  ── V5.1 配置驱动架构（行为学特征增强）
 # ============================================================
 # 共现矩阵打分引擎（完全配置驱动）
 #
@@ -13,6 +13,18 @@
 # ③ 每个主题的 scoring_rules.matrix_combinations 是其矩阵行，
 #   列（软意图）= topic_id 本身，行（硬特征）= syntax_feature
 # ④ 新增主题只需在 config_topics.py 追加，本文件零修改
+#
+# V5.1 变更摘要
+# ─────────────────────────────────────────────────────────────
+# ① 全局红线前置熔断（GLOBAL_REDLINE_REGISTRY），触发直接判死（100分）
+# ② 高危兜底锁（Floor Clamp=60），有正向高危加分事件时底线不低于 60
+# ③ BotConfidenceEngine 多维置信度机器人检测（含一票否决）
+# ④ AdvancedVoicemailDetector 高级无效通话检测（矩阵评分 + 语义防线）
+# ⑤ AI 机器人 × 伪装意图融合（_run_bot_intent_fusion）
+# ⑥ 标签层级化 + 降维压制（_apply_tag_suppression）
+# ⑦ confidence_discount 消费（rule_based 后端 → 矩阵加分折半）
+# ⑧ 跨轮次语义连贯度防线（TF-IDF 余弦相似度）
+# ⑨ standalone_score 全面压低，仅意图最多到关注区（~58分）
 # ============================================================
 
 from __future__ import annotations
@@ -184,26 +196,30 @@ def _check_whitelist(
 
 class IntelligenceScorer:
     """
-    V5.0 配置驱动的共现矩阵情报打分引擎。
+    配置驱动的共现矩阵情报打分引擎。
 
     核心流程
     ─────────────────────────────────────────────────────────
     evaluate()
-     ├─ _run_whitelist_check()         白名单豁免（SHORT CIRCUIT）
+     ├─ 红线前置熔断     GLOBAL_REDLINE_REGISTRY 正则极速扫描
      ├─ _run_high_risk_topics()        HIGH_RISK 主题动态矩阵
-     │    └── 每个主题：单项分 + 矩阵组合分
+     │    └── 每个主题：单项分 + 矩阵组合分（消费 confidence_discount）
+     ├─ _run_target_resistance_discount() 受害者抵抗降权
      ├─ _run_noise_topics()            LOW_VALUE_NOISE 降权扣分
+     ├─ _run_ood_fallback()            OOD 物理废料兜底
+     ├─ _run_whitelist_topics()        WHITELIST 豁免折扣
      ├─ _run_exemption_topics()        EXEMPTION 豁免减分
      ├─ _run_cross_topic_bonus()       跨主题复合加分
      ├─ _run_role_topology()           角色拓扑附加分
-     └─ _build_output()               边界钳位 + 输出组装
+     ├─ _run_bot_intent_fusion()       AI 机器人 × 伪装意图融合
+     └─ _build_output()               标签压制 + Floor Clamp + 输出组装
 
     扩展方法（零代码修改）
     ─────────────────────────────────────────────────────────
     在 config_topics.TOPIC_REGISTRY 中追加新主题：
       - HIGH_RISK      → 自动纳入 _run_high_risk_topics()
       - LOW_VALUE_NOISE→ 自动纳入 _run_noise_topics()
-      - WHITELIST      → 自动纳入 _run_whitelist_check()
+      - WHITELIST      → 自动纳入 _run_whitelist_topics()
       - EXEMPTION      → 自动纳入 _run_exemption_topics()
     """
 
@@ -417,9 +433,9 @@ class IntelligenceScorer:
 
         return hit_count
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Target Resistance Discount (Task 3)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 受害者抵抗降权
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def _run_target_resistance_discount(
             self,
             ctx:         _ScoringContext,
@@ -483,9 +499,9 @@ class IntelligenceScorer:
                     # 只要有一方成功抵抗，即刻生效并退出
                     return
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # LOW_VALUE_NOISE 降权扣分
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LOW_VALUE_NOISE 降权扣分
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _run_noise_topics(self, ctx: _ScoringContext, all_intents: set[str], nlp_feats: dict[str, Any]) -> None:
             for topic_id, topic_def in self._noise_topics.items():
@@ -521,9 +537,9 @@ class IntelligenceScorer:
                                 reason = f"负向矩阵压制 [{'!' if combo.requires_absence else ''}{combo.syntax_feature}] × [{topic_id}] → {combo.bonus_score:+d}"
                             )
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # WHITELIST 超级白名单 & 机器人豁免 (Task 2)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# WHITELIST 超级白名单 & 机器人豁免
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _run_whitelist_topics(
         self,
@@ -677,7 +693,7 @@ class IntelligenceScorer:
 
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # AI 机器人 × 伪装意图 核爆融合逻辑（规则 4）
+    # AI 机器人 × 伪装意图融合逻辑（规则 4）
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     # 机器人 × 意图融合触发的高危主题集合

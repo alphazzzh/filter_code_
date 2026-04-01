@@ -1,6 +1,21 @@
 # api_server.py
 # ============================================================
-# V5.0 ASR 情报风控引擎 —— 企业级高并发 API 接入层
+# V5.1 ASR 情报风控引擎 —— 企业级高并发 API 接入层
+#
+# V5.0 架构
+# ─────────────────────────────────────────────────────────────
+# ① 三阶段流水线编排（StageOneFilter → StageTwoPipeline → IntelligenceScorer）
+# ② GPU 并发控制（Semaphore）+ CPU 线程池卸载（ThreadPoolExecutor）
+# ③ SLA 超时熔断（asyncio.wait_for）+ 异常降级（206 Partial Content）
+# ④ BOT 数据进入全链路（不再在阶段一硬性拦截）
+#
+# V5.1 变更摘要
+# ─────────────────────────────────────────────────────────────
+# ① 全局过载保护（MAX_GLOBAL_REQUESTS=50 + asyncio.Lock 原子计数器）
+# ② Step 2.5 新增拓扑分析 + fastText LID 语种打标
+# ③ 阶段二/三异常降级为 206（原 500），便于 DevOps 监控
+# ④ CUDA OOM 捕获 + torch.cuda.empty_cache() 显存碎片清理
+# ⑤ 依赖注入模型路径（MODEL_BGE_PATH / MODEL_LTP_PATH / MODEL_LID_PATH）
 # ============================================================
 
 import asyncio
@@ -123,10 +138,10 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 正在优雅关闭 API 服务，释放线程池与显存...")
     state.cpu_pool.shutdown(wait=True)
 
-app = FastAPI(title="V5.0 ASR Risk Control Engine - Enterprise", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="V5.1 ASR Risk Control Engine - Enterprise", version="5.1.0", lifespan=lifespan)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1 & 2. 契约定义 (与之前保持完全一致)
+# 1. Pydantic 契约定义
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class TurnContent(BaseModel):
     id: str
@@ -163,7 +178,7 @@ class StandardResponse(BaseModel):
     data: Optional[Dict[str, Any]] = None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 3. 核心路由处理 (异步卸载与降级架构)
+# 2. 核心路由处理（异步卸载与降级架构）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.get("/api/v1/health")

@@ -1,4 +1,4 @@
-# stage_two_pipeline.py  ── V5.0 配置驱动版
+# stage_two_pipeline.py  ── V5.1 配置驱动架构（行为学特征增强）
 # ============================================================
 # Y 型双轨流水线编排（软语义 + 硬句法）
 #
@@ -11,6 +11,17 @@
 # ③ 新增句法规则只需在 config_topics.py 追加 SyntaxRuleConfig，
 #   本文件零修改
 # ④ NLP 后端层（LTP/HanLP/规则降级）保持不变
+#
+# V5.1 变更摘要
+# ─────────────────────────────────────────────────────────────
+# ① 新增 4 个行为学/心理学特征提取器：
+#      _extract_isolation_request / _extract_micro_action_command /
+#      _extract_conditional_threat / _extract_action_target_triplet
+# ② 正则缓存从模块级全局变量迁移到 SyntaxFeatureExtractor 实例级，
+#   新增 _compile_patterns() + reload()，支持热更新
+# ③ CONDITIONAL_THREAT 和 ACTION_TARGET_TRIPLET 有依存句法增强
+#   + 正则降级双路径
+# ④ needs_nlp 条件补入 CONDITIONAL_THREAT / ACTION_TARGET_TRIPLET
 # ============================================================
 
 from __future__ import annotations
@@ -41,7 +52,7 @@ class NlpFeatures:
     """
     硬句法轨道产出的结构化特征。
 
-    V5.0 变化：特征 key 由 config_topics 中的 SyntaxRuleConfig.feature_name
+    特征 key 由 config_topics 中的 SyntaxRuleConfig.feature_name
     动态决定，不再固定为三个字段。
     _bool_features  : {feature_name: bool}     产出的布尔判断
     _evidence       : {evidence_key: list[str]} 证据字符串列表（审计用）
@@ -70,9 +81,10 @@ class NlpFeatures:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 全局预编译正则缓存
-# 从 config_topics 中收集 QUANTITY_REGEX 和 REGEX_PATTERN 规则，
-# 在模块加载时一次性编译，禁止在循环中重复编译。
+# 实例级预编译正则缓存（V5.1 迁移）
+# V5.0 时期为模块级全局变量，V5.1 迁移到 SyntaxFeatureExtractor
+# 实例内部，配合 reload() 支持配置热更新。
+# 下方仅保留无状态的辅助构建函数。
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _build_quantity_pattern(units: list[str]) -> re.Pattern:
@@ -104,7 +116,7 @@ _RE_ORG_SUFFIX: re.Pattern = _build_org_suffix_pattern()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NLP 后端抽象层（与 V4.0 保持一致，仅接口不变）
+# NLP 后端抽象层（LTP / HanLP / 规则降级，三级自动降级）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class _NlpBackend:
@@ -162,7 +174,7 @@ class _LtpBackend(_NlpBackend):
                         dep.append((d.get("head", 1) - 1, d.get("label", "UNK").upper()))
         
         # ==========================================================
-        # 2. 鲁棒兼容处理命名实体识别 (ner) (修复幽灵 Bug)
+        # 2. 鲁棒兼容处理命名实体识别 (ner) 
         # ==========================================================
         ner: list[tuple[str, str]] = []
         if output.ner:
@@ -249,10 +261,16 @@ def _load_nlp_backend(ltp_model_path: str = "LTP/small") -> _NlpBackend:
 
 class SyntaxFeatureExtractor:
     """
-    V5.0 配置驱动的硬句法特征提取器。
+    配置驱动的硬句法特征提取器。
 
     初始化时从 config_topics.get_all_syntax_rules() 加载所有规则，
     extract() 遍历规则列表，按 SyntaxRuleType 动态分发到对应提取器。
+
+    V5.1 变更：
+    - 正则缓存从模块级迁移到实例级（_compiled_quantity_patterns /
+      _compiled_regex_patterns），支持 reload() 热更新
+    - 新增 4 个行为学/心理学特征提取器
+    - CONDITIONAL_THREAT / ACTION_TARGET_TRIPLET 支持依存句法增强 + 正则降级
 
     扩展方法
     ─────────────────────────────────────────────────────────
@@ -302,11 +320,16 @@ class SyntaxFeatureExtractor:
         对输入文本执行所有配置中的句法规则，返回 NlpFeatures 快照。
 
         分发逻辑：
-          QUANTITY_REGEX   → _extract_quantity_regex()
-          REGEX_PATTERN    → _extract_regex_pattern()
-          NER_DENSITY      → _extract_ner_density()   (需要 NLP 解析)
-          IMPERATIVE_SYNTAX→ _extract_imperative()     (需要 NLP 解析)
-          KEYWORD_COOC     → _extract_keyword_cooc()
+          QUANTITY_REGEX          → _extract_quantity_regex()
+          REGEX_PATTERN           → _extract_regex_pattern()
+          NER_DENSITY             → _extract_ner_density()         (需要 NLP 解析)
+          IMPERATIVE_SYNTAX       → _extract_imperative()          (需要 NLP 解析)
+          KEYWORD_COOC            → _extract_keyword_cooc()
+          VERB_ENTITY_SPARSITY    → _extract_verb_entity_sparsity()
+          ISOLATION_REQUEST       → _extract_isolation_request()    (V5.1)
+          MICRO_ACTION_COMMAND    → _extract_micro_action_command() (V5.1)
+          CONDITIONAL_THREAT      → _extract_conditional_threat()   (需要 NLP 解析, V5.1)
+          ACTION_TARGET_TRIPLET   → _extract_action_target_triplet() (需要 NLP 解析, V5.1)
         """
         feats = NlpFeatures(nlp_backend=self._backend.name)
 
@@ -723,11 +746,16 @@ class SyntaxFeatureExtractor:
 
 class StageTwoPipeline:
     """
-    V5.0 Y 型双轨流水线编排器，配置驱动，无硬编码。
+    Y 型双轨流水线编排器，配置驱动，无硬编码。
 
     两轨并行：
-      软语义轨道 → dialogue_turns[*].intent_labels
-      硬句法轨道 → metadata["nlp_features"]
+      软语义轨道 → dialogue_turns[*].intent_labels（BGE-M3 向量雷达）
+      硬句法轨道 → metadata["nlp_features"]（SyntaxFeatureExtractor）
+    
+    额外轨道：
+      动态搜索轨道 → metadata["dynamic_search"]（BGE-M3 RAG 检索）
+      角色绑定     → speaker_roles（RoleBinder）
+      拓扑分析     → track_type / interaction_features
     """
 
     def __init__(

@@ -19,7 +19,7 @@
 #                    ▼
 #              JSONL 文件 + 控制台预览
 #
-# 工业级流转建议（详见 _route_record 的注释）
+# 路由策略
 # ─────────────────────────────────────────────────────────────
 # V5.0 重构：铲除 LITE 分流，采用 PASS / SKIP 二态策略：
 #   PASS   → 正常接通记录，走完全部五个阶段
@@ -104,8 +104,7 @@ def _route_record(records: list[ASRRecord]) -> str:
     """
     根据阶段一产出决定记录的流转路径。
 
-    V5.0 重构：铲除 V1.0 的 p_unconnected / LITE 分流逻辑。
-    改为基于全量 effective_text 拼接后的去重长度判断：
+    基于全量 effective_text 拼接后的去重长度判断：
       SKIP：拼接去重后总长度 < 5，纯噪音（如"嗯"、"喂"等单字）
       PASS：其余一律放行，保留语气词供拓扑引擎分析
     """
@@ -468,8 +467,6 @@ def run_pipeline(config: PipelineConfig) -> None:
 def _aggregate_stage1_meta(records: list[ASRRecord]) -> dict[str, Any]:
     """
     将一组 ASRRecord 的阶段一元信息聚合为会话级别的单一字典。
-
-    V5.0 重构：移除 p_unconnected / entity_matched（UnconnectedDetector 已铲除），
     仅保留 bot_label 和 dominant_lang。
     """
     any_bot:      bool  = False

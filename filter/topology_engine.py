@@ -1,11 +1,18 @@
 # topology_engine.py
 # ============================================================
-# 阶段二：同源轮次合并 + 对话拓扑分流
+# 阶段二：同源轮次合并 + 对话拓扑分流 + 拓扑特征度量
 #
-# TopologyAnalyzer 职责
+# 模块组成
 # ─────────────────────────────────────────────────────────────
-#  merge_turns()      : 合并相邻同角色碎片，收敛纯语气词为 backchannel
-#  classify_track()   : 按字数分布 + 轮次节奏判定 TrackType
+#  TopologyAnalyzer    : 同源轮次合并 + 轨道分类（ASYMMETRIC / SYMMETRIC）
+#  TopologyEngine      : 拓扑特征计算引擎（filler_word_rate / 解耦盲说等）
+#  TopologyMetrics     : 多维度量快照数据类
+#
+# V5.1 变更
+# ─────────────────────────────────────────────────────────────
+# ① _FILLER_WORDS 扩充至中/英/日/粤/韩五语种
+# ② 新增 TopologyEngine + TopologyMetrics（原仅 TopologyAnalyzer）
+# ③ 新增 is_decoupled 解耦盲说判定
 # ============================================================
 
 from __future__ import annotations

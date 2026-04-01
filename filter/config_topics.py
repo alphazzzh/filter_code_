@@ -1,4 +1,4 @@
-# config_topics.py  ── V5.0 配置驱动架构
+# config_topics.py  ── V5.1 配置驱动架构（行为学特征增强）
 # ============================================================
 # 主题配置中枢（Single Source of Truth）
 #
@@ -16,6 +16,17 @@
 #   2. 在 TOPIC_REGISTRY 中注册
 #   3. 无需修改 intent_radar.py / stage_two_pipeline.py /
 #      stage_three_scorer.py 中的任何代码
+#
+# V5.1 变更摘要
+# ─────────────────────────────────────────────────────────────
+# ① SyntaxRuleType 新增 4 种行为学/心理学特征类型：
+#      ISOLATION_REQUEST / MICRO_ACTION_COMMAND /
+#      CONDITIONAL_THREAT / ACTION_TARGET_TRIPLET
+# ② ScoringRules 新增 confidence_discount 字段（规则后端衰减系数）
+# ③ standalone_score 全面压低，防止单项意图直达危险区
+# ④ 多语言支持：锚点词汇中/英/日/韩/粤五语种覆盖
+# ⑤ 新增 PROFANITY_REGISTRY（脏话/攻击性词汇库）
+# ⑥ 新增 GLOBAL_REDLINE_REGISTRY（红线前置熔断正则）
 #
 # 主题类别
 # ─────────────────────────────────────────────────────────────
@@ -160,6 +171,8 @@ class MatrixCombination:
     bonus_tag:      str
     # 如果为 True，则表示当该硬特征【不存在】时才触发此矩阵
     requires_absence: bool = False
+    # 如果为 True，则该组合无需软意图（topic_id）命中即可独立触发
+    # 常用于正则硬探针（如 insurance_scam_keywords），confidence_discount 不打折
     is_independent: bool = False
 
 
