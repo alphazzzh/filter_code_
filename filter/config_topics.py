@@ -40,10 +40,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Union
 import json
 import re
 from pathlib import Path
+
+from pydantic import BaseModel, Field, field_validator
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -152,6 +154,106 @@ class SyntaxRuleType(str, Enum):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Pydantic 强类型参数契约
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 每种 SyntaxRuleType 对应一个 Pydantic BaseModel，
+# 在 SyntaxRuleConfig.__post_init__ 中自动校验。
+# 写错 key 拼写 → 系统启动时 ValidationError 立刻崩溃。
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ImperativeSyntaxParams(BaseModel):
+    """IMPERATIVE_SYNTAX 参数：第二人称 + 紧迫状语"""
+    second_person:  list[str]  = Field(..., min_length=1, description="第二人称代词列表")
+    urgency_adverbs: list[str] = Field(..., min_length=1, description="紧迫状语列表")
+
+class QuantityRegexParams(BaseModel):
+    """QUANTITY_REGEX 参数：量词列表"""
+    quantity_units: list[str] = Field(..., min_length=1, description="量词列表")
+
+class NerDensityParams(BaseModel):
+    """NER_DENSITY 参数：实体类型 + 阈值"""
+    entity_types: list[str] = Field(..., min_length=1, description="NER 实体类型列表")
+    threshold:    int       = Field(default=3, ge=1, description="实体数量阈值")
+
+class KeywordCoocParams(BaseModel):
+    """KEYWORD_COOC 参数：多组关键词集合"""
+    keyword_sets: list[list[str]] = Field(..., min_length=1, description="关键词分组，每组至少一个列表")
+
+    @field_validator("keyword_sets")
+    @classmethod
+    def _no_empty_sets(cls, v: list[list[str]]) -> list[list[str]]:
+        for i, s in enumerate(v):
+            if not s:
+                raise ValueError(f"keyword_sets[{i}] 不能为空列表")
+        return v
+
+class RegexPatternParams(BaseModel):
+    """REGEX_PATTERN 参数：正则模式字符串 + 标志"""
+    pattern: str = Field(..., min_length=1, description="正则模式字符串")
+    flags:   str = Field(default="UNICODE", description="re 模块标志名")
+
+class VerbEntitySparsityParams(BaseModel):
+    """VERB_ENTITY_SPARSITY 参数：实体稀疏阈值"""
+    threshold: int = Field(default=3, ge=1, description="业务实体数量阈值")
+
+class IsolationRequestParams(BaseModel):
+    """ISOLATION_REQUEST 参数：隔离/阻断指令词库"""
+    isolation_keywords: list[str] = Field(..., min_length=1, description="隔离/阻断指令词库")
+
+class MicroActionCommandParams(BaseModel):
+    """MICRO_ACTION_COMMAND 参数：设备/操作微指令词库"""
+    device_action_keywords: list[str] = Field(..., min_length=1, description="设备/操作微指令词库")
+
+class ConditionalThreatParams(BaseModel):
+    """CONDITIONAL_THREAT 参数：条件从句 + 威胁主句"""
+    condition_clauses: list[str] = Field(..., min_length=1, description="条件从句词库")
+    threat_clauses:   list[str] = Field(..., min_length=1, description="威胁主句词库")
+
+class ActionTargetTripletParams(BaseModel):
+    """ACTION_TARGET_TRIPLET 参数：施事动词 + 受事实体"""
+    action_verbs:    list[str] = Field(..., min_length=1, description="施事动词列表")
+    target_entities: list[str] = Field(..., min_length=1, description="受事实体列表")
+
+class SimpleKeywordsParams(BaseModel):
+    """
+    通用关键字匹配参数。
+    用于 TEMPORAL_URGENCY / PRIVACY_INTRUSION / EMOTIONAL_MANIPULATION /
+    IDENTITY_IMPERSONATION / CHANNEL_SHIFTING 等纯字符串匹配规则。
+    """
+    keywords: list[str] = Field(..., min_length=1, description="关键字词库")
+
+
+# ── 映射表：SyntaxRuleType → Pydantic 模型类 ────────────────
+# 未在此表中的类型（如未来扩展）将跳过校验，保持向后兼容。
+_RULE_TYPE_PARAMS_MAP: dict[SyntaxRuleType, type[BaseModel]] = {
+    SyntaxRuleType.IMPERATIVE_SYNTAX:      ImperativeSyntaxParams,
+    SyntaxRuleType.QUANTITY_REGEX:         QuantityRegexParams,
+    SyntaxRuleType.NER_DENSITY:            NerDensityParams,
+    SyntaxRuleType.KEYWORD_COOC:           KeywordCoocParams,
+    SyntaxRuleType.REGEX_PATTERN:          RegexPatternParams,
+    SyntaxRuleType.VERB_ENTITY_SPARSITY:   VerbEntitySparsityParams,
+    SyntaxRuleType.ISOLATION_REQUEST:      IsolationRequestParams,
+    SyntaxRuleType.MICRO_ACTION_COMMAND:   MicroActionCommandParams,
+    SyntaxRuleType.CONDITIONAL_THREAT:     ConditionalThreatParams,
+    SyntaxRuleType.ACTION_TARGET_TRIPLET:  ActionTargetTripletParams,
+    SyntaxRuleType.FINANCIAL_FLOW:         ActionTargetTripletParams,  # 复用三元组参数结构
+    SyntaxRuleType.TEMPORAL_URGENCY:       SimpleKeywordsParams,
+    SyntaxRuleType.PRIVACY_INTRUSION:      SimpleKeywordsParams,
+    SyntaxRuleType.EMOTIONAL_MANIPULATION: SimpleKeywordsParams,
+    SyntaxRuleType.IDENTITY_IMPERSONATION: SimpleKeywordsParams,
+    SyntaxRuleType.CHANNEL_SHIFTING:       SimpleKeywordsParams,
+}
+
+# 反向映射：Pydantic 模型类 → 列表字段名（用于 evidence 收集）
+_PARAMS_KEYWORDS_FIELD: dict[type[BaseModel], str] = {
+    IsolationRequestParams:      "isolation_keywords",
+    MicroActionCommandParams:    "device_action_keywords",
+    SimpleKeywordsParams:        "keywords",
+    ActionTargetTripletParams:   "action_verbs",      # FINANCIAL_FLOW 也用这个
+}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 数据结构定义
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -164,13 +266,35 @@ class SyntaxRuleConfig:
     ----------
     rule_type    : SyntaxRuleType 枚举值，决定分发到哪个提取器
     feature_name : 本规则产出的布尔特征键名（写入 NlpFeatures dict）
-    params       : 规则类型专属参数，见 SyntaxRuleType 注释
+    params       : Pydantic 强类型参数模型（自动校验 key 拼写和类型）
     evidence_key : 可选，产出的「证据列表」键名（如匹配字符串、触发词汇）
     """
     rule_type:    SyntaxRuleType
     feature_name: str
-    params:       dict[str, Any]    = field(default_factory=dict)
-    evidence_key: str | None        = None  # 存放证据列表的键名，None=不保存证据
+    params:       Union[BaseModel, dict[str, Any]] = field(default_factory=dict)
+    evidence_key: str | None = None  # 存放证据列表的键名，None=不保存证据
+
+    def __post_init__(self) -> None:
+        """
+        构造后自动校验：如果 params 是原始 dict，尝试转换为对应的 Pydantic 模型。
+        如果 rule_type 已注册到 _RULE_TYPE_PARAMS_MAP 中，强制校验。
+        校验失败时抛出 pydantic.ValidationError，系统无法启动。
+        """
+        if isinstance(self.params, dict) and not self.params:
+            return  # 空字典跳过校验（兼容 VERB_ENTITY_SPARSITY 等仅设 threshold 的情况）
+        model_cls = _RULE_TYPE_PARAMS_MAP.get(self.rule_type)
+        if model_cls is not None:
+            if isinstance(self.params, dict):
+                # dict → Pydantic 模型，触发校验
+                self.params = model_cls.model_validate(self.params)
+            elif isinstance(self.params, BaseModel) and not isinstance(self.params, model_cls):
+                # 模型类型不匹配
+                raise TypeError(
+                    f"SyntaxRuleConfig({self.rule_type.value!r}): "
+                    f"期望 params 为 {model_cls.__name__}，"
+                    f"实际为 {type(self.params).__name__}"
+                )
+            # isinstance(self.params, model_cls) → 校验通过，无需操作
 
 
 @dataclass
@@ -361,31 +485,31 @@ _TOPIC_FRAUD_OBJECT = TopicDefinition(
             rule_type    = SyntaxRuleType.IMPERATIVE_SYNTAX,
             feature_name = "has_imperative_syntax",
             evidence_key = "imperative_verbs",
-            params = {
-                "second_person":  ["你", "您", "you"],
-                "urgency_adverbs": [
+            params = ImperativeSyntaxParams(
+                second_person=["你", "您", "you"],
+                urgency_adverbs=[
                     "马上", "立刻", "立即", "赶紧", "赶快",
                     "现在", "快", "即刻", "迅速",
                     "now", "immediately", "right now", "asap",
                 ],
-            },
+            ),
         ),
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.NER_DENSITY,
             feature_name = "high_entity_density",
             evidence_key = "entity_list",
-            params = {
-                "entity_types": ["Ni", "Ns", "ORG", "GPE", "LOC"],
-                "threshold":    3,
-            },
+            params = NerDensityParams(
+                entity_types=["Ni", "Ns", "ORG", "GPE", "LOC"],
+                threshold=3,
+            ),
         ),
         # V5.1 新增：物理隔离与信息阻断（公检法诈骗绝对高危前置动作）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.ISOLATION_REQUEST,
             feature_name = "has_isolation_request",
             evidence_key = "isolation_evidence",
-            params = {
-                "isolation_keywords": [
+            params = IsolationRequestParams(
+                isolation_keywords=[
                     # 空间隔离
                     "找个没人的地方", "找个没人的房间", "到外面去", "把门反锁",
                     "反锁门", "关上门", "独自一人", "没有人的地方",
@@ -401,15 +525,15 @@ _TOPIC_FRAUD_OBJECT = TopicDefinition(
                     "don't tell anyone", "keep it secret", "go to a private room",
                     "don't hang up", "turn off your phone",
                 ],
-            },
+            ),
         ),
         # V5.1 新增：服从性测试微动作指令
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.MICRO_ACTION_COMMAND,
             feature_name = "has_micro_action_command",
             evidence_key = "micro_action_evidence",
-            params = {
-                "device_action_keywords": [
+            params = MicroActionCommandParams(
+                device_action_keywords=[
                     # 手机设备操作
                     "打开免提", "开免提", "点右上角", "点一下右上角",
                     "点设置", "点击设置", "打开设置", "进入设置",
@@ -423,28 +547,28 @@ _TOPIC_FRAUD_OBJECT = TopicDefinition(
                     "open your settings", "tap the icon", "click the link",
                     "follow my instructions", "do exactly as I say",
                 ],
-            },
+            ),
         ),
         # V5.1 新增：语义角色三元组（谁对实体做了什么）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.ACTION_TARGET_TRIPLET,
             feature_name = "has_action_target_triplet",
             evidence_key = "triplet_evidence",
-            params = {
-                "action_verbs": [
+            params = ActionTargetTripletParams(
+                action_verbs=[
                     "转账", "汇款", "打钱", "输入", "提供", "告知",
                     "发送", "下载", "安装", "共享", "截图", "录屏",
                     "归集", "转移", "提取", "验证", "确认", "授权",
                     "tell me", "send me", "transfer", "share your",
                     "download", "install", "verify",
                 ],
-                "target_entities": [
+                target_entities=[
                     "验证码", "密码", "短信", "屏幕", "账户", "银行卡",
                     "身份证", "余额", "资金", "收款码", "付款码",
                     "信用卡", "cvv", "otp", "one-time password",
                     "screen", "password", "bank account", "credit card",
                 ],
-            },
+            ),
         ),
     ],
     scoring_rules = ScoringRules(
@@ -475,37 +599,37 @@ _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
             rule_type    = SyntaxRuleType.IMPERATIVE_SYNTAX,
             feature_name = "has_imperative_syntax",
             evidence_key = "imperative_verbs",
-            params = {
-                "second_person":  ["你", "您", "you"],
-                "urgency_adverbs": [
+            params = ImperativeSyntaxParams(
+                second_person=["你", "您", "you"],
+                urgency_adverbs=[
                     "马上", "立刻", "立即", "赶紧", "赶快",
                     "现在", "快", "即刻", "迅速",
                     "now", "immediately", "right now",
                 ],
-            },
+            ),
         ),
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.NER_DENSITY,
             feature_name = "high_entity_density",
             evidence_key = "entity_list",
-            params = {
-                "entity_types": ["Ni", "Ns", "ORG", "GPE", "LOC"],
-                "threshold":    3,
-            },
+            params = NerDensityParams(
+                entity_types=["Ni", "Ns", "ORG", "GPE", "LOC"],
+                threshold=3,
+            ),
         ),
         # V5.1: 条件胁迫（公检法诈骗核心：不配合→拘留/征信）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.CONDITIONAL_THREAT,
             feature_name = "has_conditional_threat",
             evidence_key = "conditional_threat_evidence",
-            params = {
-                "condition_clauses": [
+            params = ConditionalThreatParams(
+                condition_clauses=[
                     "如果不", "如果不配合", "如果不处理", "如果不转账",
                     "如果你不", "要是你不", "不配合的话", "不处理的话",
                     "否则", "一旦", "要是", "假如不",
                     "if you don't", "otherwise", "if not",
                 ],
-                "threat_clauses": [
+                threat_clauses=[
                     "征信", "征信受损", "信用记录", "影响征信",
                     "涉嫌", "涉嫌违法", "涉嫌犯罪", "涉嫌洗钱",
                     "拘留", "逮捕", "判刑", "坐牢", "通缉",
@@ -514,15 +638,15 @@ _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
                     "影响子女", "影响家人", "牵连",
                     "criminal", "arrest", "frozen", "credit score",
                 ],
-            },
+            ),
         ),
         # V5.2 新增：身份冒充标识（公检法诈骗核心起手式）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.IDENTITY_IMPERSONATION,
             feature_name = "has_identity_impersonation",
             evidence_key = "impersonation_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     # 公检法冒充
                     "我是警察", "我是警官", "我是公安局", "我是刑侦",
                     "我是检察官", "我是法院", "我是监管局", "我是银保监",
@@ -534,7 +658,7 @@ _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
                     "I'm calling from", "this is the police", "IRS calling",
                     "FBI", "fraud department",
                 ],
-            },
+            ),
         ),
     ],
     scoring_rules = ScoringRules(
@@ -567,20 +691,20 @@ _TOPIC_DRUG_JARGON = TopicDefinition(
             rule_type    = SyntaxRuleType.QUANTITY_REGEX,
             feature_name = "has_drug_quantity",
             evidence_key = "drug_quantity_matches",
-            params = {
-                "quantity_units": [
+            params = QuantityRegexParams(
+                quantity_units=[
                     "克", "g", "G", "公克", "mg",
                     "包", "手", "份", "颗", "粒",
                 ],
-            },
+            ),
         ),
         # V5.2 新增：渠道转移（暗语化线上交易特征）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.CHANNEL_SHIFTING,
             feature_name = "has_channel_shifting",
             evidence_key = "channel_shifting_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     # 加密通讯
                     "加微信", "加V", "加WX", "微信联系", "加TG",
                     "下载电报", "Telegram", "蝙蝠", "Signal",
@@ -590,7 +714,7 @@ _TOPIC_DRUG_JARGON = TopicDefinition(
                     # 英文暗语渠道
                     "WhatsApp", "Snapchat", "disappearing messages",
                 ],
-            },
+            ),
         ),
     ],
     scoring_rules = ScoringRules(
@@ -616,30 +740,32 @@ _TOPIC_DRUG_CHAIN = TopicDefinition(
             rule_type    = SyntaxRuleType.QUANTITY_REGEX,
             feature_name = "has_drug_quantity",
             evidence_key = "drug_quantity_matches",
-            params = {
-                "quantity_units": [
+            params = QuantityRegexParams(
+                quantity_units=[
                     "克", "g", "G", "公克", "mg",
                     "包", "手", "份", "颗", "粒",
                 ],
-            },
+            ),
         ),
         # V5.2 新增：资金流向（毒品交易核心：钱和货的流向）
+        # NOTE: FINANCIAL_FLOW 复用 ActionTargetTripletParams，key 必须为
+        #       action_verbs / target_entities（与三元组提取器一致）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.FINANCIAL_FLOW,
             feature_name = "has_financial_flow",
             evidence_key = "financial_flow_evidence",
-            params = {
-                "verbs": [
+            params = ActionTargetTripletParams(
+                action_verbs=[
                     "打到", "转到", "汇入", "汇到", "打钱", "转账",
                     "付钱", "给钱", "发红包", "扫码", "充值",
                     "withdraw", "wire transfer", "send money",
                 ],
-                "targets": [
+                target_entities=[
                     "账户", "卡号", "银行卡", "支付宝", "微信",
                     "收款码", "地址", "到付", "货到付款",
                     "account", "card", "bitcoin", "crypto",
                 ],
-            },
+            ),
         ),
     ],
     scoring_rules = ScoringRules(
@@ -682,40 +808,40 @@ _TOPIC_COERCIVE_ORG_CONTROL = TopicDefinition(
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.KEYWORD_COOC,
             feature_name = "has_coercive_threat",
-            params = {
-                "keyword_sets": [
+            params = KeywordCoocParams(
+                keyword_sets=[
                     ["如果不", "否则", "一旦"],
                 ],
-            },
+            ),
             evidence_key = None,
         ),
         # 检测「财务勒索」：金融词 + 威胁/强迫词共现
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.KEYWORD_COOC,
             feature_name = "has_coercive_financial_demand",
-            params = {
-                "keyword_sets": [
+            params = KeywordCoocParams(
+                keyword_sets=[
                     # 集合 A：金融/财务词
                     ["捐", "缴", "交钱", "付款", "费用", "资金", "献"],
                     # 集合 B：强迫/威胁词
                     ["必须", "否则", "不然", "要不然", "后果", "惩罚",
                      "报应", "灾祸", "不交就"],
                 ],
-            },
+            ),
             evidence_key = None,
         ),
         # 检测「退出威胁」：离开词 + 惩罚后果词共现
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.KEYWORD_COOC,
             feature_name = "has_exit_threat",
-            params = {
-                "keyword_sets": [
+            params = KeywordCoocParams(
+                keyword_sets=[
                     # 集合 A：退出/离开词
                     ["退出", "离开", "背叛", "不服从", "反对"],
                     # 集合 B：惩罚/后果词
                     ["惩罚", "报应", "后果", "驱逐", "出事", "灾难"],
                 ],
-            },
+            ),
             evidence_key = None,
         ),
     ],
@@ -752,38 +878,40 @@ _TOPIC_EXTREMIST_PROPAGANDA = TopicDefinition(
             rule_type    = SyntaxRuleType.EMOTIONAL_MANIPULATION,
             feature_name = "has_emotional_manipulation",
             evidence_key = "emotional_manipulation_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     "福报", "拯救", "赎罪", "神明", "唯一出路",
                     "末日", "灾难", "审判", "度人", "修行",
                     "为你好", "心疼你", "我是为你着想", "只有我能帮你",
                     "家人不理解", "世人不懂", "开悟", "觉醒",
                     "blessing", "salvation", "the only way", "enlightenment",
                 ],
-            },
+            ),
         ),
         # V5.2 新增：资金流向（邪教敛财核心）
+        # NOTE: FINANCIAL_FLOW 复用 ActionTargetTripletParams，key 必须为
+        #       action_verbs / target_entities（与三元组提取器一致）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.FINANCIAL_FLOW,
             feature_name = "has_extremist_financial_flow",
             evidence_key = "extremist_financial_evidence",
-            params = {
-                "verbs": ["捐", "献", "交", "奉献", "供养", "布施", "奉献给", "上交"],
-                "targets": ["会费", "善款", "诚意金", "奉献金", "功德", "香火钱", "组织"],
-            },
+            params = ActionTargetTripletParams(
+                action_verbs=["捐", "献", "交", "奉献", "供养", "布施", "奉献给", "上交"],
+                target_entities=["会费", "善款", "诚意金", "奉献金", "功德", "香火钱", "组织"],
+            ),
         ),
         # V5.2 新增：渠道转移（邪教传播渠道控制）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.CHANNEL_SHIFTING,
             feature_name = "has_extremist_channel_shift",
             evidence_key = "extremist_channel_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     "加我们", "加群", "内部群", "核心群", "学习群",
                     "下载APP", "安装软件", "使用这个软件",
                     "不要用微信", "不要在网上说", "私下联系",
                 ],
-            },
+            ),
         ),
     ],
     scoring_rules = ScoringRules(
@@ -815,36 +943,36 @@ _TOPIC_COORDINATED_BROADCAST = TopicDefinition(
             rule_type    = SyntaxRuleType.NER_DENSITY,
             feature_name = "high_entity_density",
             evidence_key = "entity_list",
-            params = {
-                "entity_types": ["Ni", "Ns", "ORG", "GPE", "LOC"],
-                "threshold":    3,
-            },
+            params = NerDensityParams(
+                entity_types=["Ni", "Ns", "ORG", "GPE", "LOC"],
+                threshold=3,
+            ),
         ),
         # V5.2 新增：渠道转移引导
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.CHANNEL_SHIFTING,
             feature_name = "has_broadcast_channel_shift",
             evidence_key = "broadcast_channel_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     "转发到", "发到群里", "转发群", "扩散", "传播出去",
                     "统一口径", "按这个发", "复制粘贴", "截图转发",
                     "share this", "forward to", "spread the word",
                 ],
-            },
+            ),
         ),
         # V5.2 新增：时间压力
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.TEMPORAL_URGENCY,
             feature_name = "has_broadcast_urgency",
             evidence_key = "broadcast_urgency_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     "马上转发", "立刻扩散", "紧急通知", "十万火急",
                     "赶紧通知", "时间不多了", "快去告诉", "尽快转发",
                     "urgent", "immediately forward", "act now",
                 ],
-            },
+            ),
         ),
     ],
     scoring_rules = ScoringRules(
@@ -876,13 +1004,13 @@ _TOPIC_INCITEMENT_TO_VIOLENCE = TopicDefinition(
             rule_type    = SyntaxRuleType.TEMPORAL_URGENCY,
             feature_name = "has_violence_urgency",
             evidence_key = "violence_urgency_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     "今晚", "明天", "趁现在", "就在今天", "马上行动",
                     "时机已到", "不能再等", "时间紧迫", "抓紧时间",
                     "tonight", "right now", "before it's too late",
                 ],
-            },
+            ),
         ),
     ],
     scoring_rules = ScoringRules(
@@ -1026,25 +1154,25 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.REGEX_PATTERN,
             feature_name = "has_insurance_scam_keywords",
-            params       = {
-                "pattern": r"(百万保障|微保|安全保险|账户保险|资金安全险).{0,30}(到期|收费|扣费|解除|关闭|续费)|(微信|支付宝|拼多多).{0,30}(百万保障|微保|客服中心)"
-            }
+            params = RegexPatternParams(
+                pattern=r"(百万保障|微保|安全保险|账户保险|资金安全险).{0,30}(到期|收费|扣费|解除|关闭|续费)|(微信|支付宝|拼多多).{0,30}(百万保障|微保|客服中心)"
+            )
         ),
         # 备用金/白条/客服引导链接等泛金融高危探针
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.REGEX_PATTERN,
             feature_name = "has_financial_scam_keywords",
-            params       = {
-                "pattern": r"(备用金|白条|金条|借呗|微粒贷).{0,30}(额度|关闭|激活|服务费|违约金|征信)|(点击|打开).{0,10}(链接|网址|屏幕共享)|(京东|金融|淘宝|客服).{0,20}(注销|额度|回执)"
-            }
+            params = RegexPatternParams(
+                pattern=r"(备用金|白条|金条|借呗|微粒贷).{0,30}(额度|关闭|激活|服务费|违约金|征信)|(点击|打开).{0,10}(链接|网址|屏幕共享)|(京东|金融|淘宝|客服).{0,20}(注销|额度|回执)"
+            )
         ),
         # V5.1 新增：服从性测试微动作指令（电商客服特供）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.MICRO_ACTION_COMMAND,
             feature_name = "has_ecommerce_micro_cmd",
             evidence_key = "ecommerce_micro_cmd_evidence",
-            params = {
-                "device_action_keywords": [
+            params = MicroActionCommandParams(
+                device_action_keywords=[
                     # 屏幕操作
                     "打开微信", "打开支付宝", "打开手机银行",
                     "点右上角", "点我的", "点设置", "点击服务",
@@ -1059,34 +1187,34 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
                     # 英文版电商引导
                     "open the app", "go to settings", "share your screen",
                 ],
-            },
+            ),
         ),
         # V5.1 新增：条件胁迫（「不关闭百万保障会扣费」）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.CONDITIONAL_THREAT,
             feature_name = "has_ecommerce_conditional_threat",
             evidence_key = "ecommerce_threat_evidence",
-            params = {
-                "condition_clauses": [
+            params = ConditionalThreatParams(
+                condition_clauses=[
                     "如果不", "如果不关闭", "不处理的话", "不取消",
                     "不及时", "逾期", "今天不",
                     "if you don't", "unless you",
                 ],
-                "threat_clauses": [
+                threat_clauses=[
                     "扣费", "收费", "自动续费", "每月扣",
                     "影响征信", "征信", "信用",
                     "冻结", "封号", "限制", "无法使用",
                     "charged", "fee", "freeze",
                 ],
-            },
+            ),
         ),
         # V5.2 新增：隐私信息索取（电商诈骗核心收割动作）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.PRIVACY_INTRUSION,
             feature_name = "has_ecommerce_privacy_intrusion",
             evidence_key = "ecommerce_privacy_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     "验证码", "短信验证码", "手机验证码", "动态验证码",
                     "身份证号", "身份证正反面", "身份证照片",
                     "银行卡号", "卡号", "信用卡号", "有效期",
@@ -1094,15 +1222,15 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
                     "登录密码", "支付密码", "交易密码",
                     "one-time password", "OTP", "social security number",
                 ],
-            },
+            ),
         ),
         # V5.2 新增：渠道转移（离开平台到非官方渠道）
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.CHANNEL_SHIFTING,
             feature_name = "has_ecommerce_channel_shift",
             evidence_key = "ecommerce_channel_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     "下载APP", "安装软件", "打开这个APP",
                     "点击链接", "点开链接", "打开网址",
                     "加微信", "加QQ", "加客服微信",
@@ -1110,21 +1238,21 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
                     "屏幕共享", "共享屏幕", "开启屏幕共享",
                     "download the app", "click the link", "scan the QR code",
                 ],
-            },
+            ),
         ),
         # V5.2 新增：时间压力
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.TEMPORAL_URGENCY,
             feature_name = "has_ecommerce_temporal_urgency",
             evidence_key = "ecommerce_urgency_evidence",
-            params = {
-                "keywords": [
+            params = SimpleKeywordsParams(
+                keywords=[
                     "今天之内", "逾期不处理", "最后期限", "马上到期",
                     "今天不处理就", "不操作就扣费", "超过24小时",
                     "抓紧时间", "马上处理", "立即取消",
                     "within 24 hours", "before it expires", "act immediately",
                 ],
-            },
+            ),
         ),
     ],
     scoring_rules = ScoringRules(
@@ -1187,7 +1315,7 @@ _TOPIC_CORPORATE_LOGISTICS = TopicDefinition(
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.VERB_ENTITY_SPARSITY,
             feature_name = "is_business_sparse",
-            params       = {"threshold": 2}, # 实体极少
+            params = VerbEntitySparsityParams(threshold=2),  # 实体极少
         )
     ],
     scoring_rules = ScoringRules(
@@ -1328,7 +1456,7 @@ _TOPIC_GLOBAL_SYNTAX_REGISTRY = TopicDefinition(
         SyntaxRuleConfig(
             rule_type    = SyntaxRuleType.VERB_ENTITY_SPARSITY,
             feature_name = "is_business_sparse",
-            params       = {"threshold": 2}, 
+            params = VerbEntitySparsityParams(threshold=2), 
         )
     ],
     scoring_rules = ScoringRules(standalone_score=0)

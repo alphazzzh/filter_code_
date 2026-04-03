@@ -49,6 +49,19 @@ from config_topics import (
     SyntaxRuleType,
     TOPIC_REGISTRY,
     get_all_syntax_rules,
+    # V5.2+ Pydantic 强类型参数模型（消除 config↔pipeline 字符串 Key 隐形耦合）
+    ImperativeSyntaxParams,
+    QuantityRegexParams,
+    NerDensityParams,
+    KeywordCoocParams,
+    RegexPatternParams,
+    VerbEntitySparsityParams,
+    IsolationRequestParams,
+    MicroActionCommandParams,
+    ConditionalThreatParams,
+    ActionTargetTripletParams,
+    SimpleKeywordsParams,
+    _RULE_TYPE_PARAMS_MAP,
 )
 
 
@@ -302,18 +315,32 @@ class SyntaxFeatureExtractor:
         self._compiled_regex_patterns.clear()
         for _rule in self._rules.values():
             if _rule.rule_type == SyntaxRuleType.QUANTITY_REGEX:
-                _units = _rule.params.get("quantity_units", [])
-                if _units:
+                # 强类型：直接访问 QuantityRegexParams.quantity_units
+                units = (
+                    _rule.params.quantity_units
+                    if isinstance(_rule.params, QuantityRegexParams)
+                    else _rule.params.get("quantity_units", [])
+                )
+                if units:
                     self._compiled_quantity_patterns[_rule.feature_name] = (
-                        _build_quantity_pattern(_units)
+                        _build_quantity_pattern(units)
                     )
             elif _rule.rule_type == SyntaxRuleType.REGEX_PATTERN:
-                _pattern_str = _rule.params.get("pattern", "")
-                if _pattern_str:
-                    _flags_str = _rule.params.get("flags", "UNICODE")
-                    _flags     = getattr(re, _flags_str, re.UNICODE)
+                # 强类型：直接访问 RegexPatternParams.pattern / flags
+                pattern_str = (
+                    _rule.params.pattern
+                    if isinstance(_rule.params, RegexPatternParams)
+                    else _rule.params.get("pattern", "")
+                )
+                if pattern_str:
+                    flags_str = (
+                        _rule.params.flags
+                        if isinstance(_rule.params, RegexPatternParams)
+                        else _rule.params.get("flags", "UNICODE")
+                    )
+                    flags = getattr(re, flags_str, re.UNICODE)
                     self._compiled_regex_patterns[_rule.feature_name] = re.compile(
-                        _pattern_str, _flags
+                        pattern_str, flags
                     )
 
     def reload(self) -> None:
@@ -457,10 +484,15 @@ class SyntaxFeatureExtractor:
 
         entity_types 参数支持 LTP 标签（Ni/Ns）和 HanLP 标签（ORG/GPE/LOC）。
         """
-        entity_types: frozenset[str] = frozenset(
-            rule.params.get("entity_types", ["Ni", "Ns", "ORG", "GPE", "LOC"])
-        )
-        threshold: int = int(rule.params.get("threshold", 3))
+        p = rule.params
+        if isinstance(p, NerDensityParams):
+            entity_types: frozenset[str] = frozenset(p.entity_types)
+            threshold: int = p.threshold
+        else:
+            entity_types = frozenset(
+                p.get("entity_types", ["Ni", "Ns", "ORG", "GPE", "LOC"])
+            )
+            threshold = int(p.get("threshold", 3))
 
         entities: list[str] = [
             ent_text
@@ -491,15 +523,20 @@ class SyntaxFeatureExtractor:
 
         降级：dep 为空时使用正则近似检测。
         """
-        second_person:  frozenset[str] = frozenset(
-            rule.params.get("second_person", ["你", "您", "you"])
-        )
-        urgency_adverbs: frozenset[str] = frozenset(
-            rule.params.get("urgency_adverbs", [
-                "马上", "立刻", "立即", "赶紧", "赶快",
-                "现在", "快", "即刻", "迅速",
-            ])
-        )
+        p = rule.params
+        if isinstance(p, ImperativeSyntaxParams):
+            second_person:  frozenset[str] = frozenset(p.second_person)
+            urgency_adverbs: frozenset[str] = frozenset(p.urgency_adverbs)
+        else:
+            second_person = frozenset(
+                p.get("second_person", ["你", "您", "you"])
+            )
+            urgency_adverbs = frozenset(
+                p.get("urgency_adverbs", [
+                    "马上", "立刻", "立即", "赶紧", "赶快",
+                    "现在", "快", "即刻", "迅速",
+                ])
+            )
 
         tokens: list[str]            = parsed.get("tokens", [])
         dep:    list[tuple[int, str]] = parsed.get("dep", [])
@@ -550,7 +587,7 @@ class SyntaxFeatureExtractor:
         """
         KEYWORD_COOC：多关键词集合共现检测。
 
-        逻辑：params["keyword_sets"] 是一个列表的列表。
+        逻辑：params.keyword_sets 是一个列表的列表。
         每个子列表至少有一个词在 text 中出现，
         且所有子列表均满足 → 判定命中。
 
@@ -561,7 +598,11 @@ class SyntaxFeatureExtractor:
           ]
           → 文本中同时含有 A 中至少一个词 AND B 中至少一个词 → 命中
         """
-        keyword_sets: list[list[str]] = rule.params.get("keyword_sets", [])
+        p = rule.params
+        keyword_sets: list[list[str]] = (
+            p.keyword_sets if isinstance(p, KeywordCoocParams)
+            else p.get("keyword_sets", [])
+        )
         if not keyword_sets:
             return
 
@@ -577,7 +618,11 @@ class SyntaxFeatureExtractor:
         parsed: dict[str, Any], rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
         """VERB_ENTITY_SPARSITY：实体与业务词极度稀疏检测"""
-        threshold: int = int(rule.params.get("threshold", 3))
+        p = rule.params
+        threshold: int = (
+            p.threshold if isinstance(p, VerbEntitySparsityParams)
+            else int(p.get("threshold", 3))
+        )
         
         # 统计核心业务名词（机构、地名、人名等）的数量
         entities = [ent_type for _, ent_type in parsed.get("ner", [])]
@@ -604,7 +649,11 @@ class SyntaxFeatureExtractor:
           - 通讯阻断：「不要挂电话」「开启飞行模式」「拦截短信」「关掉WiFi」
           - 社交阻断：「不能告诉家人」「国家机密」「不要跟别人说」
         """
-        isolation_keywords: list[str] = rule.params.get("isolation_keywords", [])
+        p = rule.params
+        isolation_keywords: list[str] = (
+            p.isolation_keywords if isinstance(p, IsolationRequestParams)
+            else p.get("isolation_keywords", [])
+        )
         if not isolation_keywords:
             return
 
@@ -627,7 +676,11 @@ class SyntaxFeatureExtractor:
           - 屏幕引导：「往下滑」「点击链接」「扫码」
           - 行为测试：「跟着我读一遍」「你现在打开」「不要动手机」
         """
-        device_keywords: list[str] = rule.params.get("device_action_keywords", [])
+        p = rule.params
+        device_keywords: list[str] = (
+            p.device_action_keywords if isinstance(p, MicroActionCommandParams)
+            else p.get("device_action_keywords", [])
+        )
         if not device_keywords:
             return
 
@@ -652,8 +705,13 @@ class SyntaxFeatureExtractor:
 
         降级策略：无依存句法时使用正则匹配条件从句模式。
         """
-        condition_clauses: list[str] = rule.params.get("condition_clauses", [])
-        threat_clauses:   list[str] = rule.params.get("threat_clauses", [])
+        p = rule.params
+        if isinstance(p, ConditionalThreatParams):
+            condition_clauses: list[str] = p.condition_clauses
+            threat_clauses:   list[str] = p.threat_clauses
+        else:
+            condition_clauses = p.get("condition_clauses", [])
+            threat_clauses   = p.get("threat_clauses", [])
         if not condition_clauses or not threat_clauses:
             return
 
@@ -703,8 +761,13 @@ class SyntaxFeatureExtractor:
         rule: SyntaxRuleConfig,
         feats: NlpFeatures,
     ) -> None:
-        action_verbs:    list[str] = rule.params.get("action_verbs", [])
-        target_entities: list[str] = rule.params.get("target_entities", [])
+        p = rule.params
+        if isinstance(p, ActionTargetTripletParams):
+            action_verbs:    list[str] = p.action_verbs
+            target_entities: list[str] = p.target_entities
+        else:
+            action_verbs    = p.get("action_verbs", [])
+            target_entities = p.get("target_entities", [])
         if not action_verbs or not target_entities:
             return
 
@@ -784,9 +847,13 @@ class SyntaxFeatureExtractor:
           TEMPORAL_URGENCY / PRIVACY_INTRUSION / EMOTIONAL_MANIPULATION
           IDENTITY_IMPERSONATION / CHANNEL_SHIFTING
 
-        统一使用 params["keywords"] 作为匹配词库。
+        统一使用 SimpleKeywordsParams.keywords 作为匹配词库。
         """
-        keywords: list[str] = rule.params.get("keywords", [])
+        p = rule.params
+        keywords: list[str] = (
+            p.keywords if isinstance(p, SimpleKeywordsParams)
+            else p.get("keywords", [])
+        )
         if not keywords:
             return
 
