@@ -1,4 +1,4 @@
-# stage_three_scorer.py  ── V5.1 配置驱动架构（行为学特征增强）
+# stage_three_scorer.py  ── V5.2 配置驱动架构（多维特征增强）
 # ============================================================
 # 共现矩阵打分引擎（完全配置驱动）
 #
@@ -25,6 +25,13 @@
 # ⑦ confidence_discount 消费（rule_based 后端 → 矩阵加分折半）
 # ⑧ 跨轮次语义连贯度防线（TF-IDF 余弦相似度）
 # ⑨ standalone_score 全面压低，仅意图最多到关注区（~58分）
+#
+# V5.2 变更摘要
+# ─────────────────────────────────────────────────────────────
+# ① _run_high_risk_topics 返回值改为 set[str]（命中的主题族集合）
+# ② _run_cross_topic_bonus 改为跨族复合加分（同族不叠加）
+# ③ _run_target_resistance_discount 改为三级阶梯式（Tier1=-10/Tier2=-20/Tier3=-35）
+# ④ 新增顺从率 >= 20% 免疫条件（高度顺从时抵抗全部无效）
 # ============================================================
 
 from __future__ import annotations
@@ -340,14 +347,14 @@ class IntelligenceScorer:
                     if v: agent_nlp_feats[k] = v
 
         # ── 1. HIGH_RISK：动态矩阵加分 ──
-        high_risk_hit_count = self._run_high_risk_topics(ctx, all_intents, agent_nlp_feats)
+        hit_families = self._run_high_risk_topics(ctx, all_intents, agent_nlp_feats)
 
         # ── 2. 全局受害者抵抗降权 (Task 3) ──
-        self._run_target_resistance_discount(ctx, stage2_result, high_risk_hit_count > 0)
+        self._run_target_resistance_discount(ctx, stage2_result, len(hit_families) > 0)
 
         # ── 3. LOW_VALUE_NOISE & OOD 物理兜底 ──
-        # 🚨 核心逻辑：高危意图绝对优先。未命中风险时，才进行废料降权。
-        if high_risk_hit_count == 0:
+        # 核心逻辑：高危意图绝对优先。未命中风险时，才进行废料降权。
+        if not hit_families:
             # 3.1 语义层降权（已知类别的废话：外卖/闲聊/打错电话）
             self._run_noise_topics(ctx, all_intents, nlp_feats)
             
@@ -360,7 +367,7 @@ class IntelligenceScorer:
 
         # ── 5. 其他辅助/结构性评分 ──
         self._run_exemption_topics(ctx, stage2_result, all_intents)
-        self._run_cross_topic_bonus(ctx, high_risk_hit_count)
+        self._run_cross_topic_bonus(ctx, hit_families)
         self._run_role_topology(ctx, stage2_result, all_intents)
         self._run_bot_intent_fusion(ctx, stage2_result, all_intents, is_bot_verdict)
 
@@ -375,17 +382,17 @@ class IntelligenceScorer:
         ctx:         _ScoringContext,
         all_intents: set[str],
         agent_nlp_feats: dict[str, Any],
-    ) -> int:
+    ) -> set[str]:
         """
         遍历所有 HIGH_RISK 主题，对每个命中的主题执行：
           Step A：单项基础分（无硬特征强化，低置信度）
           Step B：遍历 matrix_combinations，查找共现矩阵命中
                   条件：该主题意图被命中 AND 对应硬特征为 True
-          Step C：记录该主题是否有任何命中（供跨主题复合加分计数）
+          Step C：记录命中的 topic_family（供跨族复合加分使用）
 
-        返回：命中（触发过分值变化）的主题数量
+        返回：命中的主题族集合（去重）
         """
-        hit_count = 0
+        hit_families: set[str] = set()
 
         for topic_id, topic_def in self._high_risk_topics.items():
             has_soft_intent = topic_id in all_intents
@@ -429,9 +436,9 @@ class IntelligenceScorer:
                 topic_hit = True
 
             if topic_hit:
-                hit_count += 1
+                hit_families.add(topic_def.topic_family)
 
-        return hit_count
+        return hit_families
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 受害者抵抗降权
@@ -443,15 +450,18 @@ class IntelligenceScorer:
             has_high_risk: bool,
         ) -> None:
             """
-            全局受害者抵抗降权机制（已修复平权聊天盲区与类型错误）：
-            如果高危对话中潜在受害者明确拒绝/抵抗且顺从度极低，则视为失败的犯罪尝试，大幅扣分。
-            同时追加「诈骗未遂」状态标签（scam_attempt_rejected），具有极高情报价值。
+            V5.2 阶梯式受害者抵抗降权机制。
+
+            三级阶梯：
+              Tier 1 (轻度): 抵抗率 > 0 但 < 0.15，仅轻微口头抗拒 → -10
+              Tier 2 (中度): 抵抗率 >= 0.15，明确质疑 → -20
+              Tier 3 (重度): 抵抗率 >= 0.25 或明确识破(dismissal)，诈骗未遂 → -35
+
+            免疫条件：顺从率 >= 20% → 抵抗全部无效（受害者仍在被控）
             """
             if not has_high_risk:
                 return
 
-            # 👇 核心修复：result.speaker_roles 是 list[SpeakerRoleResult]
-            # 遍历对象列表，只要角色的 role 属性不是 AGENT，就提取他的 speaker_id
             potential_resisters = [
                 sr.speaker_id for sr in result.speaker_roles
                 if sr.role != RoleLabel.AGENT
@@ -460,7 +470,6 @@ class IntelligenceScorer:
             if not potential_resisters:
                 return
 
-            # 遍历所有潜在受害者，只要有一人成功抵抗，即可触发降权
             for target_sid in potential_resisters:
                 target_turns = [
                     t for t in result.dialogue_turns
@@ -469,7 +478,6 @@ class IntelligenceScorer:
                 if not target_turns:
                     continue
 
-                # 收集该受害者的所有意图，方便快速判断是否包含绝对的质变信号
                 target_intents = {label for t in target_turns for label in t.intent_labels}
 
                 resistance_intents = {"dismissal", "rejection"}
@@ -483,20 +491,38 @@ class IntelligenceScorer:
                 )
                 compliance_rate = compliance_count / len(target_turns)
 
-                # 🚨 终极微调：抵抗率 > 0.25 (量变) 或者 明确识破(质变)
-                if (resistance_rate > 0.25 or "dismissal" in target_intents) and compliance_rate < 0.10:
+                # 免疫：只要还在高度顺从，抵抗全部无效
+                if compliance_rate >= 0.20:
+                    continue
+
+                # V5.2 阶梯式抵抗惩罚
+                if "dismissal" in target_intents or resistance_rate >= 0.25:
+                    # Tier 3：质变——明确识破或高频拒绝，诈骗未遂
                     ctx.apply(
                         delta  = -35,
                         tag    = "fraud_failed_target_resisted",
                         reason = (
-                            f"检测到高危风险，但疑似受害者({target_sid})明确拒绝/脱战"
+                            f"检测到高危风险，但疑似受害者({target_sid})明确识破并脱战"
                             f"（抵抗率={resistance_rate:.2f}或触发绝对识破），案件降级为未遂线索"
                         ),
                     )
-                    # 追加「诈骗未遂」状态标签——情报分析的核心信号
                     ctx.tags.add(_SCAM_ATTEMPT_REJECTED_TAG)
-                    
-                    # 只要有一方成功抵抗，即刻生效并退出
+                    return
+                elif resistance_rate >= 0.15:
+                    # Tier 2：中度——强烈质疑
+                    ctx.apply(
+                        delta  = -20,
+                        tag    = "target_strong_resistance",
+                        reason = f"疑似受害者({target_sid})表现出中度抵触与质疑（抵抗率={resistance_rate:.2f}）",
+                    )
+                    return
+                elif resistance_rate > 0.0:
+                    # Tier 1：轻度——轻微抗拒（可能只是随口骂一句）
+                    ctx.apply(
+                        delta  = -10,
+                        tag    = "target_mild_resistance",
+                        reason = f"疑似受害者({target_sid})表现出轻微抗拒（抵抗率={resistance_rate:.2f}）",
+                    )
                     return
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -616,16 +642,22 @@ class IntelligenceScorer:
 
     @staticmethod
     def _run_cross_topic_bonus(
-        ctx: _ScoringContext, high_risk_hit_count: int
+        ctx: _ScoringContext, hit_families: set[str]
     ) -> None:
-        """当同时命中 >= _CROSS_TOPIC_MIN_HITS 个独立风险主题时额外加分。"""
-        if high_risk_hit_count >= _CROSS_TOPIC_MIN_HITS:
+        """
+        V5.2 跨族复合加分：当命中 >= 2 个不同的主题族时额外加分，同族不叠加。
+
+        排除默认的 general 族，要求真实的跨领域作案才触发。
+        例如：fraud + narcotics = 跨族（加分）；fraud + fraud = 同族（不加分）。
+        """
+        valid_families = hit_families - {"general"}
+        if len(valid_families) >= _CROSS_TOPIC_MIN_HITS:
             ctx.apply(
                 delta  = _CROSS_TOPIC_BONUS,
                 tag    = _CROSS_TOPIC_BONUS_TAG,
                 reason = (
-                    f"跨主题复合命中 {high_risk_hit_count} 个高风险主题，"
-                    "升级综合危险等级"
+                    f"跨族群复合命中 {len(valid_families)} 个高危作案领域 "
+                    f"({','.join(sorted(valid_families))})，升级综合危险等级"
                 ),
             )
 
@@ -781,7 +813,7 @@ class IntelligenceScorer:
                 tag    = fusion_tag,
                 reason = (
                     f"命中 AI 机器人批量外呼与高危意图 [{topic_id}] 融合，"
-                    f"判定为机器诈骗试探 (ping_pong={ppr:.4f}, filler_rate={fwr:.4f})"
+                    "判定为机器诈骗试探"
                 ),
             )
 

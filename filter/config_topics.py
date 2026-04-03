@@ -117,6 +117,38 @@ class SyntaxRuleType(str, Enum):
     # params: action_verbs (list[str]), target_entities (list[str])
     # 产出: feature_name → bool
 
+    # ── V5.2 新增：更丰富的行为与心理特征 ───────────────
+
+    TEMPORAL_URGENCY = "temporal_urgency"
+    # 时间压力表达：制造紧迫感催促受害者立即行动
+    # params: keywords (list[str]) — 时间压力词库
+    # 产出: feature_name → bool
+
+    PRIVACY_INTRUSION = "privacy_intrusion"
+    # 隐私信息索取：要求受害者提供敏感个人信息
+    # params: keywords (list[str]) — 隐私信息索取词库
+    # 产出: feature_name → bool
+
+    EMOTIONAL_MANIPULATION = "emotional_manipulation"
+    # 情绪操控：利用情感绑定（心疼/担心/为你好）建立信任
+    # params: keywords (list[str]) — 情绪操控词库
+    # 产出: feature_name → bool
+
+    FINANCIAL_FLOW = "financial_flow"
+    # 资金流向描述：涉及资金转移/归集/缴纳（复用三元组提取器，LTP 增强）
+    # params: verbs (list[str]), targets (list[str])
+    # 产出: feature_name → bool
+
+    IDENTITY_IMPERSONATION = "identity_impersonation"
+    # 身份冒充标识：伪装公检法/银行/平台工作人员身份
+    # params: keywords (list[str]) — 身份冒充词库
+    # 产出: feature_name → bool
+
+    CHANNEL_SHIFTING = "channel_shifting"
+    # 渠道转移引导：引导受害者转移到非官方通信渠道
+    # params: keywords (list[str]) — 渠道转移词库
+    # 产出: feature_name → bool
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -222,6 +254,7 @@ class TopicDefinition:
     description:  str
     bge_anchors:  list[str]
     threshold:    float
+    topic_family: str = "general"               # V5.2: 主题族，用于跨族复合加分
     syntax_rules: list[SyntaxRuleConfig]    = field(default_factory=list)
     scoring_rules: ScoringRules             = field(default_factory=ScoringRules)
 
@@ -297,6 +330,7 @@ OOD_FALLBACK_REGISTRY: list[OODFallbackRule] = [
 _TOPIC_FRAUD_JARGON = TopicDefinition(
     topic_id    = "fraud_jargon",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "fraud",
     description = "诈骗黑话/地下产业链隐语（跑分/水房/卡接等），脱离上下文即高度可疑",
     threshold   = 0.70,  # 黑话锚点特异性强，适当降低阈值提升召回
         bge_anchors=[],
@@ -318,6 +352,7 @@ _TOPIC_FRAUD_JARGON = TopicDefinition(
 _TOPIC_FRAUD_OBJECT = TopicDefinition(
     topic_id    = "fraud_object",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "fraud",
     description = "诈骗高危业务客体（验证码/屏幕共享/账户转账等），是诈骗指令的「宾语」成分",
     threshold   = 0.72,
         bge_anchors=[],
@@ -431,6 +466,7 @@ _TOPIC_FRAUD_OBJECT = TopicDefinition(
 _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
     topic_id    = "authority_entity",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "fraud",
     description = "权威伪装实体（冒充公检法/监管机构），制造权威压迫感",
     threshold   = 0.72,
         bge_anchors=[],
@@ -480,6 +516,26 @@ _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
                 ],
             },
         ),
+        # V5.2 新增：身份冒充标识（公检法诈骗核心起手式）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.IDENTITY_IMPERSONATION,
+            feature_name = "has_identity_impersonation",
+            evidence_key = "impersonation_evidence",
+            params = {
+                "keywords": [
+                    # 公检法冒充
+                    "我是警察", "我是警官", "我是公安局", "我是刑侦",
+                    "我是检察官", "我是法院", "我是监管局", "我是银保监",
+                    "XX分局", "XX派出所", "刑侦大队",
+                    # 银行/平台冒充
+                    "我是银行工作人员", "客服中心", "风控部门",
+                    "银联", "反诈中心", "征信中心",
+                    # 英文冒充
+                    "I'm calling from", "this is the police", "IRS calling",
+                    "FBI", "fraud department",
+                ],
+            },
+        ),
     ],
     scoring_rules = ScoringRules(
         standalone_score = 10,    # V5.1: 压低单项（原22）
@@ -489,6 +545,7 @@ _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
             MatrixCombination("high_entity_density",        12, "fraud_authority_entity_dense"),
             MatrixCombination("has_isolation_request",      22, "authority_isolation_extreme"),    # V5.1: 隔离+权威=极危
             MatrixCombination("has_conditional_threat",     25, "authority_conditional_coercion"),  # V5.1: 条件胁迫+权威=极高危
+            MatrixCombination("has_identity_impersonation", 20, "authority_impersonation_extreme"), # V5.2: 身份冒充+权威=极高危
         ],
     ),
 )
@@ -501,6 +558,7 @@ _TOPIC_AUTHORITY_ENTITY = TopicDefinition(
 _TOPIC_DRUG_JARGON = TopicDefinition(
     topic_id    = "drug_jargon",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "narcotics",
     description = "毒品隐语（白/冰/K粉/草等），写场景句提高语境特异性",
     threshold   = 0.70,
         bge_anchors=[],
@@ -516,13 +574,32 @@ _TOPIC_DRUG_JARGON = TopicDefinition(
                 ],
             },
         ),
+        # V5.2 新增：渠道转移（暗语化线上交易特征）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.CHANNEL_SHIFTING,
+            feature_name = "has_channel_shifting",
+            evidence_key = "channel_shifting_evidence",
+            params = {
+                "keywords": [
+                    # 加密通讯
+                    "加微信", "加V", "加WX", "微信联系", "加TG",
+                    "下载电报", "Telegram", "蝙蝠", "Signal",
+                    "阅后即焚", "加密软件", "私密聊天", "加密通讯",
+                    # 线上交易渠道
+                    "转账到这里", "打到这个", "扫码付款", "收款码",
+                    # 英文暗语渠道
+                    "WhatsApp", "Snapchat", "disappearing messages",
+                ],
+            },
+        ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 10,    # V5.1: 压低（原22）
+        standalone_score = 15,    # V5.2: 适度抬高（有矩阵支撑）
         standalone_tag   = "has_drug_jargon",
         matrix_combinations = [
-            MatrixCombination("has_drug_quantity", 25, "drug_quantity_jargon"),     # V5.1: 压低（原50）
-            MatrixCombination("high_entity_density", 10, "drug_jargon_dense"),      # V5.1: 压低（原20）
+            MatrixCombination("has_drug_quantity", 25, "drug_quantity_jargon"),
+            MatrixCombination("high_entity_density", 10, "drug_jargon_dense"),
+            MatrixCombination("has_channel_shifting", 20, "drug_jargon_covert_channel"),  # V5.2: 暗语+渠道转移=高危
         ],
     ),
 )
@@ -530,6 +607,7 @@ _TOPIC_DRUG_JARGON = TopicDefinition(
 _TOPIC_DRUG_CHAIN = TopicDefinition(
     topic_id    = "drug_chain",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "narcotics",
     description = "毒品交易链条（上下游关系/物流/货款等），与 drug_jargon + has_drug_quantity 共现还原完整交易模型",
     threshold   = 0.72,
         bge_anchors=[],
@@ -545,13 +623,33 @@ _TOPIC_DRUG_CHAIN = TopicDefinition(
                 ],
             },
         ),
+        # V5.2 新增：资金流向（毒品交易核心：钱和货的流向）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.FINANCIAL_FLOW,
+            feature_name = "has_financial_flow",
+            evidence_key = "financial_flow_evidence",
+            params = {
+                "verbs": [
+                    "打到", "转到", "汇入", "汇到", "打钱", "转账",
+                    "付钱", "给钱", "发红包", "扫码", "充值",
+                    "withdraw", "wire transfer", "send money",
+                ],
+                "targets": [
+                    "账户", "卡号", "银行卡", "支付宝", "微信",
+                    "收款码", "地址", "到付", "货到付款",
+                    "account", "card", "bitcoin", "crypto",
+                ],
+            },
+        ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 8,     # V5.1: 压低（原15）
+        standalone_score = 12,     # V5.2: 适度抬高（有矩阵支撑）
         standalone_tag   = "has_drug_chain",
         matrix_combinations = [
-            MatrixCombination("has_drug_quantity",   18, "drug_quantity_chain"),    # V5.1: 压低（原35）
-            MatrixCombination("high_entity_density",  8, "drug_chain_dense"),        # V5.1: 压低（原12）
+            MatrixCombination("has_drug_quantity",   18, "drug_quantity_chain"),
+            MatrixCombination("high_entity_density",  8, "drug_chain_dense"),
+            MatrixCombination("has_financial_flow",  22, "drug_chain_financial_flow"),  # V5.2: 交易链+资金流向=高危
+            MatrixCombination("has_channel_shifting", 18, "drug_chain_covert_channel"),  # V5.2: 交易链+渠道转移
         ],
     ),
 )
@@ -572,6 +670,7 @@ _TOPIC_DRUG_CHAIN = TopicDefinition(
 _TOPIC_COERCIVE_ORG_CONTROL = TopicDefinition(
     topic_id    = "coercive_org_control",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "coercion",
     description = (
         "有组织强制控制行为：通过金融勒索/孤立威胁/退出惩罚实施心理控制，"
         "聚焦犯罪行为模式，与具体团体名称或信仰内容无关"
@@ -643,15 +742,58 @@ _TOPIC_COERCIVE_ORG_CONTROL = TopicDefinition(
 _TOPIC_EXTREMIST_PROPAGANDA = TopicDefinition(
     topic_id    = "extremist_propaganda",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "extremism",
     description = "极端思想与邪教传播：已知邪教组织标识性用语、末世论、度人话术等",
     threshold   = 0.70,
         bge_anchors=[],
-    syntax_rules = [],
+    syntax_rules = [
+        # V5.2 新增：情绪操控（邪教核心：感情绑定+末日恐慌）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.EMOTIONAL_MANIPULATION,
+            feature_name = "has_emotional_manipulation",
+            evidence_key = "emotional_manipulation_evidence",
+            params = {
+                "keywords": [
+                    "福报", "拯救", "赎罪", "神明", "唯一出路",
+                    "末日", "灾难", "审判", "度人", "修行",
+                    "为你好", "心疼你", "我是为你着想", "只有我能帮你",
+                    "家人不理解", "世人不懂", "开悟", "觉醒",
+                    "blessing", "salvation", "the only way", "enlightenment",
+                ],
+            },
+        ),
+        # V5.2 新增：资金流向（邪教敛财核心）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.FINANCIAL_FLOW,
+            feature_name = "has_extremist_financial_flow",
+            evidence_key = "extremist_financial_evidence",
+            params = {
+                "verbs": ["捐", "献", "交", "奉献", "供养", "布施", "奉献给", "上交"],
+                "targets": ["会费", "善款", "诚意金", "奉献金", "功德", "香火钱", "组织"],
+            },
+        ),
+        # V5.2 新增：渠道转移（邪教传播渠道控制）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.CHANNEL_SHIFTING,
+            feature_name = "has_extremist_channel_shift",
+            evidence_key = "extremist_channel_evidence",
+            params = {
+                "keywords": [
+                    "加我们", "加群", "内部群", "核心群", "学习群",
+                    "下载APP", "安装软件", "使用这个软件",
+                    "不要用微信", "不要在网上说", "私下联系",
+                ],
+            },
+        ),
+    ],
     scoring_rules = ScoringRules(
-        standalone_score = 15,    # V5.1: 压低（原40）
+        standalone_score = 15,
         standalone_tag   = "extremist_propaganda",
         matrix_combinations = [
-            MatrixCombination("high_entity_density", 8, "extremist_with_dense_entities"),  # V5.1: 压低（原10）
+            MatrixCombination("high_entity_density",            8, "extremist_with_dense_entities"),
+            MatrixCombination("has_emotional_manipulation",    20, "extremist_mind_control"),         # V5.2
+            MatrixCombination("has_extremist_financial_flow",  25, "extremist_financial_harvest"),     # V5.2
+            MatrixCombination("has_extremist_channel_shift",   18, "extremist_channel_control"),       # V5.2
         ],
     ),
 )
@@ -664,6 +806,7 @@ _TOPIC_EXTREMIST_PROPAGANDA = TopicDefinition(
 _TOPIC_COORDINATED_BROADCAST = TopicDefinition(
     topic_id    = "coordinated_broadcast",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "subversion",
     description = "有组织批量传播行为：指挥他人大规模、统一口径传播，与内容立场无关",
     threshold   = 0.72,
         bge_anchors=[],
@@ -677,12 +820,40 @@ _TOPIC_COORDINATED_BROADCAST = TopicDefinition(
                 "threshold":    3,
             },
         ),
+        # V5.2 新增：渠道转移引导
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.CHANNEL_SHIFTING,
+            feature_name = "has_broadcast_channel_shift",
+            evidence_key = "broadcast_channel_evidence",
+            params = {
+                "keywords": [
+                    "转发到", "发到群里", "转发群", "扩散", "传播出去",
+                    "统一口径", "按这个发", "复制粘贴", "截图转发",
+                    "share this", "forward to", "spread the word",
+                ],
+            },
+        ),
+        # V5.2 新增：时间压力
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.TEMPORAL_URGENCY,
+            feature_name = "has_broadcast_urgency",
+            evidence_key = "broadcast_urgency_evidence",
+            params = {
+                "keywords": [
+                    "马上转发", "立刻扩散", "紧急通知", "十万火急",
+                    "赶紧通知", "时间不多了", "快去告诉", "尽快转发",
+                    "urgent", "immediately forward", "act now",
+                ],
+            },
+        ),
     ],
     scoring_rules = ScoringRules(
-        standalone_score = 10,
+        standalone_score = 12,
         standalone_tag   = "coordinated_broadcast",
         matrix_combinations = [
-            MatrixCombination("high_entity_density", 15, "broadcast_with_dense_entities"),
+            MatrixCombination("high_entity_density",          15, "broadcast_with_dense_entities"),
+            MatrixCombination("has_broadcast_channel_shift",  20, "broadcast_channel_amplification"),  # V5.2
+            MatrixCombination("has_broadcast_urgency",        18, "broadcast_urgent_amplification"),    # V5.2
         ],
     ),
 )
@@ -695,15 +866,31 @@ _TOPIC_COORDINATED_BROADCAST = TopicDefinition(
 _TOPIC_INCITEMENT_TO_VIOLENCE = TopicDefinition(
     topic_id    = "incitement_to_violence",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "violence",
     description = "明确号召对具体目标实施身体伤害，排除比喻性/游戏化用法",
     threshold   = 0.76,  # 高精确率阈值，避免误判比喻
         bge_anchors=[],
-    syntax_rules = [],
+    syntax_rules = [
+        # V5.2 新增：时间压力（暴力煽动的紧迫感）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.TEMPORAL_URGENCY,
+            feature_name = "has_violence_urgency",
+            evidence_key = "violence_urgency_evidence",
+            params = {
+                "keywords": [
+                    "今晚", "明天", "趁现在", "就在今天", "马上行动",
+                    "时机已到", "不能再等", "时间紧迫", "抓紧时间",
+                    "tonight", "right now", "before it's too late",
+                ],
+            },
+        ),
+    ],
     scoring_rules = ScoringRules(
-        standalone_score = 15,    # V5.1: 压低（原40）
+        standalone_score = 15,
         standalone_tag   = "incitement_to_violence",
         matrix_combinations = [
-            MatrixCombination("high_entity_density", 8, "violence_with_dense_entities"),  # V5.1: 压低（原10）
+            MatrixCombination("high_entity_density",  8, "violence_with_dense_entities"),
+            MatrixCombination("has_violence_urgency", 20, "violence_urgent_action"),  # V5.2
         ],
     ),
 )
@@ -830,6 +1017,7 @@ _TOPIC_CSR_BOT_WHITELIST = TopicDefinition(
 _TOPIC_E_COMMERCE_CS = TopicDefinition(
     topic_id    = "e_commerce_cs",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "fraud",
     description = "电商/泛金融客服伪装起手式，配合诈骗客体或高压句法形成连招",
     threshold   = 0.72,
     bge_anchors=[],
@@ -892,6 +1080,52 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
                 ],
             },
         ),
+        # V5.2 新增：隐私信息索取（电商诈骗核心收割动作）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.PRIVACY_INTRUSION,
+            feature_name = "has_ecommerce_privacy_intrusion",
+            evidence_key = "ecommerce_privacy_evidence",
+            params = {
+                "keywords": [
+                    "验证码", "短信验证码", "手机验证码", "动态验证码",
+                    "身份证号", "身份证正反面", "身份证照片",
+                    "银行卡号", "卡号", "信用卡号", "有效期",
+                    "CVV", "cvv", "安全码", "背面三位数",
+                    "登录密码", "支付密码", "交易密码",
+                    "one-time password", "OTP", "social security number",
+                ],
+            },
+        ),
+        # V5.2 新增：渠道转移（离开平台到非官方渠道）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.CHANNEL_SHIFTING,
+            feature_name = "has_ecommerce_channel_shift",
+            evidence_key = "ecommerce_channel_evidence",
+            params = {
+                "keywords": [
+                    "下载APP", "安装软件", "打开这个APP",
+                    "点击链接", "点开链接", "打开网址",
+                    "加微信", "加QQ", "加客服微信",
+                    "扫码", "扫二维码", "扫这个码",
+                    "屏幕共享", "共享屏幕", "开启屏幕共享",
+                    "download the app", "click the link", "scan the QR code",
+                ],
+            },
+        ),
+        # V5.2 新增：时间压力
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.TEMPORAL_URGENCY,
+            feature_name = "has_ecommerce_temporal_urgency",
+            evidence_key = "ecommerce_urgency_evidence",
+            params = {
+                "keywords": [
+                    "今天之内", "逾期不处理", "最后期限", "马上到期",
+                    "今天不处理就", "不操作就扣费", "超过24小时",
+                    "抓紧时间", "马上处理", "立即取消",
+                    "within 24 hours", "before it expires", "act immediately",
+                ],
+            },
+        ),
     ],
     scoring_rules = ScoringRules(
         standalone_score = 8,     # V5.1: 压低（原15）
@@ -905,6 +1139,10 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
             # 独立触发（正则硬探针保留高权重）
             MatrixCombination("has_insurance_scam_keywords",      30, "critical_insurance_scam", is_independent=True),
             MatrixCombination("has_financial_scam_keywords",      30, "critical_financial_scam", is_independent=True),
+            # V5.2 新增矩阵
+            MatrixCombination("has_ecommerce_privacy_intrusion",  22, "fake_cs_privacy_harvest"),       # V5.2
+            MatrixCombination("has_ecommerce_channel_shift",      20, "fake_cs_channel_shift"),         # V5.2
+            MatrixCombination("has_ecommerce_temporal_urgency",   18, "fake_cs_urgency_trap"),          # V5.2
         ],
     ),
 )
@@ -912,6 +1150,7 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
 _TOPIC_MASS_GRIEVANCE = TopicDefinition(
     topic_id    = "mass_grievance",
     category    = TopicCategory.HIGH_RISK,
+    topic_family= "grievance",
     description = "涉军/群体维权与涉稳信访",
     threshold   = 0.68,
         bge_anchors=[],

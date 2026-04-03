@@ -1,4 +1,4 @@
-# stage_two_pipeline.py  ── V5.1 配置驱动架构（行为学特征增强）
+# stage_two_pipeline.py  ── V5.2 配置驱动架构（多维特征增强）
 # ============================================================
 # Y 型双轨流水线编排（软语义 + 硬句法）
 #
@@ -22,6 +22,15 @@
 # ③ CONDITIONAL_THREAT 和 ACTION_TARGET_TRIPLET 有依存句法增强
 #   + 正则降级双路径
 # ④ needs_nlp 条件补入 CONDITIONAL_THREAT / ACTION_TARGET_TRIPLET
+#
+# V5.2 变更摘要
+# ─────────────────────────────────────────────────────────────
+# ① 新增 6 种特征类型提取器：
+#      TEMPORAL_URGENCY / PRIVACY_INTRUSION / EMOTIONAL_MANIPULATION
+#      FINANCIAL_FLOW / IDENTITY_IMPERSONATION / CHANNEL_SHIFTING
+# ② 新增通用轻量级关键字提取器 _extract_simple_keywords
+# ③ FINANCIAL_FLOW 复用 _extract_action_target_triplet（LTP 增强）
+# ④ needs_nlp 条件补入 FINANCIAL_FLOW
 # ============================================================
 
 from __future__ import annotations
@@ -341,6 +350,7 @@ class SyntaxFeatureExtractor:
                 SyntaxRuleType.VERB_ENTITY_SPARSITY,
                 SyntaxRuleType.CONDITIONAL_THREAT,      # V5.1: 条件胁迫依赖依存句法
                 SyntaxRuleType.ACTION_TARGET_TRIPLET,   # V5.1: 三元组提取依赖 NER
+                SyntaxRuleType.FINANCIAL_FLOW,          # V5.2: 资金流向复用三元组，依赖 NER
             )
             for r in self._rules.values()
         )
@@ -377,6 +387,26 @@ class SyntaxFeatureExtractor:
                 self._extract_conditional_threat(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.ACTION_TARGET_TRIPLET:
+                self._extract_action_target_triplet(text, parsed, rule, feats)
+
+            # ── V5.2 新增：多维行为/心理/交易特征提取器 ─────────
+            elif rule.rule_type == SyntaxRuleType.TEMPORAL_URGENCY:
+                self._extract_simple_keywords(text, rule, feats)
+
+            elif rule.rule_type == SyntaxRuleType.PRIVACY_INTRUSION:
+                self._extract_simple_keywords(text, rule, feats)
+
+            elif rule.rule_type == SyntaxRuleType.EMOTIONAL_MANIPULATION:
+                self._extract_simple_keywords(text, rule, feats)
+
+            elif rule.rule_type == SyntaxRuleType.IDENTITY_IMPERSONATION:
+                self._extract_simple_keywords(text, rule, feats)
+
+            elif rule.rule_type == SyntaxRuleType.CHANNEL_SHIFTING:
+                self._extract_simple_keywords(text, rule, feats)
+
+            elif rule.rule_type == SyntaxRuleType.FINANCIAL_FLOW:
+                # 复用三元组提取器（LTP 增强 + 正则降级双路径）
                 self._extract_action_target_triplet(text, parsed, rule, feats)
 
         return feats
@@ -739,6 +769,32 @@ class SyntaxFeatureExtractor:
             triplets = [f"{v}→{t}" for v in hit_verbs for t in hit_targets]
             feats.add_evidence(rule.evidence_key, triplets[:6])
 
+
+    # ── V5.2 新增：通用轻量级关键字提取器 ──────────────────
+
+    @staticmethod
+    def _extract_simple_keywords(
+        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+    ) -> None:
+        """
+        通用字符串集合匹配提取器。
+
+        适用于纯字符串匹配型规则（无 NLP 依赖），避免为每种新特征
+        写一个结构完全相同的提取方法。支持的规则类型：
+          TEMPORAL_URGENCY / PRIVACY_INTRUSION / EMOTIONAL_MANIPULATION
+          IDENTITY_IMPERSONATION / CHANNEL_SHIFTING
+
+        统一使用 params["keywords"] 作为匹配词库。
+        """
+        keywords: list[str] = rule.params.get("keywords", [])
+        if not keywords:
+            return
+
+        hit_words = [kw for kw in keywords if kw in text]
+        if hit_words:
+            feats.set_feature(rule.feature_name, True)
+            if rule.evidence_key:
+                feats.add_evidence(rule.evidence_key, hit_words[:3])
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # StageTwoPipeline —— V5.0 配置驱动编排器

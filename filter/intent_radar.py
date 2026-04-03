@@ -378,7 +378,7 @@ class IntentRadar:
         try:
             # 1. 构造检索向量
             query_instruction = f"为这个句子生成表示以用于检索相关文章：{clean_topic}"
-            query_vec = self._model.encode([query_instruction])[0]
+            query_vec = self._model.encode([query_instruction])["dense_vecs"][0]
             
             # 2. 对所有滑动窗口块进行向量化
             doc_vecs = self._model.encode(search_chunks)

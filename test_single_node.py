@@ -3,8 +3,8 @@ import json
 import os
 
 # 导入你封装好的两个节点
-from filter.langgraph_risk_node import RiskControlNode
-from translater.langgraph_translation_node import TranslationNode
+from filter.filter_node import FilterNode
+#from translater.langgraph_translation_node import TranslationNode
 
 # ==========================================
 # 1. 准备你的 Mock 数据 (用你手头搬运出来的数据)
@@ -30,19 +30,19 @@ async def test_nodes():
     
     # ⚠️ 注意：如果你在外网没有 LTP 本地模型，这里可能会报警告并降级为规则匹配，这是正常的！
     # BGE-M3 会自动从 HuggingFace 下载缓存（如果你有外网的话）
-    risk_node = RiskControlNode(
+    risk_node = FilterNode(
         bge_model_name="BAAI/bge-m3", 
         ltp_model_path="LTP/small", # 如果外网没有这个目录，会走平滑降级
         log_dir="test_logs"         # 测试时把日志写在明确的地方
     )
-    
+    '''
     translation_node = TranslationNode(
         # 换成你在外网能调通的大模型 API，比如硅基流动、Kimi 等
         # base_url="...", 
         # model_name="...",
         log_dir="test_logs"
     )
-
+    '''
     print("\n" + "="*50)
     print("🧪 测试案例 1：京东备用金诈骗 (风控 + 翻译)")
     print("="*50)
