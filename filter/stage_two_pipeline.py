@@ -47,6 +47,7 @@ from role_binder import RoleBinder
 from config_topics import (
     SyntaxRuleConfig,
     SyntaxRuleType,
+    MatchMode,
     TOPIC_REGISTRY,
     get_all_syntax_rules,
     # V5.2+ Pydantic 强类型参数模型（消除 config↔pipeline 字符串 Key 隐形耦合）
@@ -310,34 +311,23 @@ class SyntaxFeatureExtractor:
         self._compile_patterns()
 
     def _compile_patterns(self) -> None:
-        """扫描当前 self._rules，预编译所有 QUANTITY_REGEX / REGEX_PATTERN 正则。"""
+        """扫描当前 self._rules，预编译所有 QUANTITY_REGEX / REGEX_PATTERN 正则。
+
+        V5.3: 清理 .get() 死代码，直接访问 Pydantic 模型属性。
+        """
         self._compiled_quantity_patterns.clear()
         self._compiled_regex_patterns.clear()
         for _rule in self._rules.values():
             if _rule.rule_type == SyntaxRuleType.QUANTITY_REGEX:
-                # 强类型：直接访问 QuantityRegexParams.quantity_units
-                units = (
-                    _rule.params.quantity_units
-                    if isinstance(_rule.params, QuantityRegexParams)
-                    else _rule.params.get("quantity_units", [])
-                )
+                units = _rule.params.quantity_units
                 if units:
                     self._compiled_quantity_patterns[_rule.feature_name] = (
                         _build_quantity_pattern(units)
                     )
             elif _rule.rule_type == SyntaxRuleType.REGEX_PATTERN:
-                # 强类型：直接访问 RegexPatternParams.pattern / flags
-                pattern_str = (
-                    _rule.params.pattern
-                    if isinstance(_rule.params, RegexPatternParams)
-                    else _rule.params.get("pattern", "")
-                )
+                pattern_str = _rule.params.pattern
                 if pattern_str:
-                    flags_str = (
-                        _rule.params.flags
-                        if isinstance(_rule.params, RegexPatternParams)
-                        else _rule.params.get("flags", "UNICODE")
-                    )
+                    flags_str = _rule.params.flags
                     flags = getattr(re, flags_str, re.UNICODE)
                     self._compiled_regex_patterns[_rule.feature_name] = re.compile(
                         pattern_str, flags
@@ -381,6 +371,9 @@ class SyntaxFeatureExtractor:
             )
             for r in self._rules.values()
         )
+        # V5.3: EXACT_WORD 模式需要分词结果，即使其他规则不需要 NLP
+        needs_nlp = needs_nlp or self._needs_nlp_for_match_mode()
+
         parsed: dict[str, Any] = self._backend.analyze(text) if needs_nlp else {}
 
         for rule in self._rules.values():
@@ -397,7 +390,7 @@ class SyntaxFeatureExtractor:
                 self._extract_imperative(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.KEYWORD_COOC:
-                self._extract_keyword_cooc(text, rule, feats)
+                self._extract_keyword_cooc(text, parsed, feats)
 
 
             elif rule.rule_type == SyntaxRuleType.VERB_ENTITY_SPARSITY:
@@ -405,10 +398,10 @@ class SyntaxFeatureExtractor:
 
             # ── V5.1 新增：行为学/心理学特征提取器 ────────────
             elif rule.rule_type == SyntaxRuleType.ISOLATION_REQUEST:
-                self._extract_isolation_request(text, rule, feats)
+                self._extract_isolation_request(text, parsed, feats)
 
             elif rule.rule_type == SyntaxRuleType.MICRO_ACTION_COMMAND:
-                self._extract_micro_action_command(text, rule, feats)
+                self._extract_micro_action_command(text, parsed, feats)
 
             elif rule.rule_type == SyntaxRuleType.CONDITIONAL_THREAT:
                 self._extract_conditional_threat(text, parsed, rule, feats)
@@ -418,25 +411,102 @@ class SyntaxFeatureExtractor:
 
             # ── V5.2 新增：多维行为/心理/交易特征提取器 ─────────
             elif rule.rule_type == SyntaxRuleType.TEMPORAL_URGENCY:
-                self._extract_simple_keywords(text, rule, feats)
+                self._extract_simple_keywords(text, parsed, feats)
 
             elif rule.rule_type == SyntaxRuleType.PRIVACY_INTRUSION:
-                self._extract_simple_keywords(text, rule, feats)
+                self._extract_simple_keywords(text, parsed, feats)
 
             elif rule.rule_type == SyntaxRuleType.EMOTIONAL_MANIPULATION:
-                self._extract_simple_keywords(text, rule, feats)
+                self._extract_simple_keywords(text, parsed, feats)
 
             elif rule.rule_type == SyntaxRuleType.IDENTITY_IMPERSONATION:
-                self._extract_simple_keywords(text, rule, feats)
+                self._extract_simple_keywords(text, parsed, feats)
 
             elif rule.rule_type == SyntaxRuleType.CHANNEL_SHIFTING:
-                self._extract_simple_keywords(text, rule, feats)
+                self._extract_simple_keywords(text, parsed, feats)
 
             elif rule.rule_type == SyntaxRuleType.FINANCIAL_FLOW:
                 # 复用三元组提取器（LTP 增强 + 正则降级双路径）
                 self._extract_action_target_triplet(text, parsed, rule, feats)
 
         return feats
+
+    # ── V5.3 词边界匹配核心方法 ──────────────────────────────────
+
+    def _needs_nlp_for_match_mode(self) -> bool:
+        """检查是否有规则使用了 EXACT_WORD 模式（需要分词结果）。"""
+        return any(
+            getattr(r.params, "match_mode", MatchMode.SUBSTR) == MatchMode.EXACT_WORD
+            for r in self._rules.values()
+        )
+
+    @staticmethod
+    def _match_keyword(
+        kw:          str,
+        text:        str,
+        tokens:      list[str],
+        nlp_backend: str,
+        mode:        MatchMode,
+    ) -> bool:
+        """
+        V5.3 NLP 后端感知的词边界匹配。
+
+        策略：
+          SUBSTR         → kw in text（向后兼容）
+          EXACT_WORD     → LTP/HanLP: kw in tokens（真分词精确匹配）
+                           rule_based: 退回 _regex_chinese_boundary（tokens 是逐字拆分不可用）
+          REGEX_BOUNDARY → 中文字边界正则：前后不能有中文字符或下划线
+                           使用 (?<![\\u4e00-\\u9fff\\w]) 和 (?![\\u4e00-\\u9fff\\w])
+                           覆盖"字符串边界 + 标点/空格 + 非中文词边界"场景
+
+        注意：\\b 对中文无效（中文没有空格分词），故 REGEX_BOUNDARY 使用
+              Unicode 范围检查代替标准 \\b。
+        """
+        if mode == MatchMode.SUBSTR:
+            return kw in text
+
+        if mode == MatchMode.EXACT_WORD:
+            if nlp_backend in ("LTP", "hanlp"):
+                return kw in tokens
+            # rule_based 后端 tokens = list(text) 逐字拆分，不可用于精确词匹配
+            # 退回中文边界正则
+            return SyntaxFeatureExtractor._regex_chinese_boundary(kw, text)
+
+        if mode == MatchMode.REGEX_BOUNDARY:
+            return SyntaxFeatureExtractor._regex_chinese_boundary(kw, text)
+
+        return kw in text  # 兜底
+
+    @staticmethod
+    def _regex_chinese_boundary(kw: str, text: str) -> bool:
+        """
+        中文词边界正则匹配（rule_based 后端降级方案）。
+
+        核心问题：中文没有空格分词，\\b 对中文完全无效。
+        正则无法区分"交"在"交警"（子串）和"请交费"（独立词）中的角色。
+        因此本方法的策略是**保守保护**：
+
+        1. 单字关键词（如"交"、"捐"）：
+           检查是否出现在标点/空格/字符串边界旁，且后面不紧贴中文字符。
+           这只能拦截最明显的误报（"交"出现在字符串末尾或标点后），
+           对于"请交费"这种正常语境中的独立用法也会漏判。
+           → 单字误报防护建议使用 EXACT_WORD 模式（依赖 LTP 分词）。
+
+        2. 多字关键词（如"交钱"、"退出"）：
+           直接使用 SUBSTR（多字本身的误报率远低于单字）。
+           例："交钱"不太可能成为某个更长中文词的子串。
+
+        结论：如果 NLP 后端可用，应优先使用 EXACT_WORD；
+              REGEX_BOUNDARY 只是 rule_based 后端退而求其次的保底方案。
+        """
+        # 单字关键词：保守边界保护
+        if len(kw) == 1:
+            # 只检查后方边界：关键词后面不紧贴中文字符或字母数字
+            # 前方不做限制（中文句子中词前面几乎总是中文字符）
+            pattern = rf"{re.escape(kw)}(?![\u4e00-\u9fff\w])"
+            return bool(re.search(pattern, text))
+        # 多字关键词：误报率低，直接子串匹配
+        return kw in text
 
     # ── 各类型提取器 ──────────────────────────────────────────
 
@@ -483,16 +553,12 @@ class SyntaxFeatureExtractor:
         NER_DENSITY：统计指定类型实体数量是否达到阈值。
 
         entity_types 参数支持 LTP 标签（Ni/Ns）和 HanLP 标签（ORG/GPE/LOC）。
+
+        V5.3: 清理 .get() 死代码。
         """
         p = rule.params
-        if isinstance(p, NerDensityParams):
-            entity_types: frozenset[str] = frozenset(p.entity_types)
-            threshold: int = p.threshold
-        else:
-            entity_types = frozenset(
-                p.get("entity_types", ["Ni", "Ns", "ORG", "GPE", "LOC"])
-            )
-            threshold = int(p.get("threshold", 3))
+        entity_types: frozenset[str] = frozenset(p.entity_types)
+        threshold: int = p.threshold
 
         entities: list[str] = [
             ent_text
@@ -522,21 +588,12 @@ class SyntaxFeatureExtractor:
         Step 4: 两项同时满足 → 命中，记录核心动词
 
         降级：dep 为空时使用正则近似检测。
+
+        V5.3: 清理 .get() 死代码。
         """
         p = rule.params
-        if isinstance(p, ImperativeSyntaxParams):
-            second_person:  frozenset[str] = frozenset(p.second_person)
-            urgency_adverbs: frozenset[str] = frozenset(p.urgency_adverbs)
-        else:
-            second_person = frozenset(
-                p.get("second_person", ["你", "您", "you"])
-            )
-            urgency_adverbs = frozenset(
-                p.get("urgency_adverbs", [
-                    "马上", "立刻", "立即", "赶紧", "赶快",
-                    "现在", "快", "即刻", "迅速",
-                ])
-            )
+        second_person:   frozenset[str] = frozenset(p.second_person)
+        urgency_adverbs: frozenset[str] = frozenset(p.urgency_adverbs)
 
         tokens: list[str]            = parsed.get("tokens", [])
         dep:    list[tuple[int, str]] = parsed.get("dep", [])
@@ -580,9 +637,8 @@ class SyntaxFeatureExtractor:
             if rule.evidence_key:
                 feats.add_evidence(rule.evidence_key, imperative_verbs)
 
-    @staticmethod
     def _extract_keyword_cooc(
-        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+        self, text: str, parsed: dict[str, Any], rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
         """
         KEYWORD_COOC：多关键词集合共现检测。
@@ -597,17 +653,20 @@ class SyntaxFeatureExtractor:
               ["必须", "否则", "后果"],# 子列表 B：威胁词
           ]
           → 文本中同时含有 A 中至少一个词 AND B 中至少一个词 → 命中
+
+        V5.3: 支持 match_mode 参数，默认 SUBSTR 向后兼容。
         """
         p = rule.params
-        keyword_sets: list[list[str]] = (
-            p.keyword_sets if isinstance(p, KeywordCoocParams)
-            else p.get("keyword_sets", [])
-        )
+        keyword_sets: list[list[str]] = p.keyword_sets
+        match_mode:   MatchMode       = getattr(p, "match_mode", MatchMode.SUBSTR)
         if not keyword_sets:
             return
 
+        tokens      = parsed.get("tokens", [])
+        nlp_backend = feats.nlp_backend
+
         all_sets_matched = all(
-            any(kw in text for kw in kw_set)
+            any(self._match_keyword(kw, text, tokens, nlp_backend, match_mode) for kw in kw_set)
             for kw_set in keyword_sets
         )
         if all_sets_matched:
@@ -617,12 +676,12 @@ class SyntaxFeatureExtractor:
     def _extract_verb_entity_sparsity(
         parsed: dict[str, Any], rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
-        """VERB_ENTITY_SPARSITY：实体与业务词极度稀疏检测"""
+        """VERB_ENTITY_SPARSITY：实体与业务词极度稀疏检测
+
+        V5.3: 清理 .get() 死代码。
+        """
         p = rule.params
-        threshold: int = (
-            p.threshold if isinstance(p, VerbEntitySparsityParams)
-            else int(p.get("threshold", 3))
-        )
+        threshold: int = p.threshold
         
         # 统计核心业务名词（机构、地名、人名等）的数量
         entities = [ent_type for _, ent_type in parsed.get("ner", [])]
@@ -636,9 +695,8 @@ class SyntaxFeatureExtractor:
 
     # ── V5.1 新增：行为学/心理学特征提取器 ──────────────────
 
-    @staticmethod
     def _extract_isolation_request(
-        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+        self, text: str, parsed: dict[str, Any], rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
         """
         ISOLATION_REQUEST：物理隔离与信息阻断检测。
@@ -648,24 +706,27 @@ class SyntaxFeatureExtractor:
           - 空间隔离：「找个没人的房间」「把门反锁」「到外面去」
           - 通讯阻断：「不要挂电话」「开启飞行模式」「拦截短信」「关掉WiFi」
           - 社交阻断：「不能告诉家人」「国家机密」「不要跟别人说」
+
+        V5.3: 支持 match_mode 参数。
         """
         p = rule.params
-        isolation_keywords: list[str] = (
-            p.isolation_keywords if isinstance(p, IsolationRequestParams)
-            else p.get("isolation_keywords", [])
-        )
+        isolation_keywords: list[str] = p.isolation_keywords
+        match_mode:         MatchMode = getattr(p, "match_mode", MatchMode.SUBSTR)
         if not isolation_keywords:
             return
 
-        hit_words = [kw for kw in isolation_keywords if kw in text]
+        tokens      = parsed.get("tokens", [])
+        nlp_backend = feats.nlp_backend
+
+        hit_words = [kw for kw in isolation_keywords
+                     if self._match_keyword(kw, text, tokens, nlp_backend, match_mode)]
         if hit_words:
             feats.set_feature(rule.feature_name, True)
             if rule.evidence_key:
                 feats.add_evidence(rule.evidence_key, hit_words)
 
-    @staticmethod
     def _extract_micro_action_command(
-        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+        self, text: str, parsed: dict[str, Any], rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
         """
         MICRO_ACTION_COMMAND：服从性测试与微动作指令检测。
@@ -675,27 +736,27 @@ class SyntaxFeatureExtractor:
           - 设备操作：「打开免提」「点右上角」「点一下设置」
           - 屏幕引导：「往下滑」「点击链接」「扫码」
           - 行为测试：「跟着我读一遍」「你现在打开」「不要动手机」
+
+        V5.3: 支持 match_mode 参数。
         """
         p = rule.params
-        device_keywords: list[str] = (
-            p.device_action_keywords if isinstance(p, MicroActionCommandParams)
-            else p.get("device_action_keywords", [])
-        )
+        device_keywords: list[str] = p.device_action_keywords
+        match_mode:      MatchMode = getattr(p, "match_mode", MatchMode.SUBSTR)
         if not device_keywords:
             return
 
-        hit_words = [kw for kw in device_keywords if kw in text]
+        tokens      = parsed.get("tokens", [])
+        nlp_backend = feats.nlp_backend
+
+        hit_words = [kw for kw in device_keywords
+                     if self._match_keyword(kw, text, tokens, nlp_backend, match_mode)]
         if hit_words:
             feats.set_feature(rule.feature_name, True)
             if rule.evidence_key:
                 feats.add_evidence(rule.evidence_key, hit_words)
 
-    @staticmethod
     def _extract_conditional_threat(
-        text: str,
-        parsed: dict[str, Any],
-        rule: SyntaxRuleConfig,
-        feats: NlpFeatures,
+        self, text: str, parsed: dict[str, Any], rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
         """
         CONDITIONAL_THREAT：条件胁迫与逻辑陷阱检测。
@@ -704,25 +765,32 @@ class SyntaxFeatureExtractor:
           [如果不...] → [征信受损/涉嫌违法/拘留/影响子女]
 
         降级策略：无依存句法时使用正则匹配条件从句模式。
+
+        V5.3: 支持 match_mode 参数；清理 .get() 死代码。
         """
         p = rule.params
-        if isinstance(p, ConditionalThreatParams):
-            condition_clauses: list[str] = p.condition_clauses
-            threat_clauses:   list[str] = p.threat_clauses
-        else:
-            condition_clauses = p.get("condition_clauses", [])
-            threat_clauses   = p.get("threat_clauses", [])
+        condition_clauses: list[str] = p.condition_clauses
+        threat_clauses:   list[str] = p.threat_clauses
+        match_mode:       MatchMode = getattr(p, "match_mode", MatchMode.SUBSTR)
         if not condition_clauses or not threat_clauses:
             return
 
+        tokens      = parsed.get("tokens", [])
+        nlp_backend = feats.nlp_backend
+
         # 检测条件从句是否出现
-        has_condition = any(cond in text for cond in condition_clauses)
+        has_condition = any(
+            self._match_keyword(cond, text, tokens, nlp_backend, match_mode)
+            for cond in condition_clauses
+        )
         # 检测威胁主句是否出现
-        has_threat = any(threat in text for threat in threat_clauses)
+        has_threat = any(
+            self._match_keyword(threat, text, tokens, nlp_backend, match_mode)
+            for threat in threat_clauses
+        )
 
         # ── 依存句法增强：确认条件-威胁在同一小句范围内 ──
-        tokens: list[str]            = parsed.get("tokens", [])
-        dep:    list[tuple[int, str]] = parsed.get("dep", [])
+        dep: list[tuple[int, str]] = parsed.get("dep", [])
 
         syntactic_confirm = False
         if dep and tokens and has_condition and has_threat:
@@ -748,35 +816,39 @@ class SyntaxFeatureExtractor:
             feats.set_feature(rule.feature_name, True)
             hit_list = []
             if has_condition:
-                hit_list.extend(c for c in condition_clauses if c in text)
+                hit_list.extend(c for c in condition_clauses
+                                if self._match_keyword(c, text, tokens, nlp_backend, match_mode))
             if has_threat:
-                hit_list.extend(t for t in threat_clauses if t in text)
+                hit_list.extend(t for t in threat_clauses
+                                if self._match_keyword(t, text, tokens, nlp_backend, match_mode))
             if rule.evidence_key and hit_list:
                 feats.add_evidence(rule.evidence_key, hit_list[:6])  # 最多保留 6 条证据
 
-    @staticmethod
     def _extract_action_target_triplet(
-        text: str,
-        parsed: dict[str, Any],
-        rule: SyntaxRuleConfig,
-        feats: NlpFeatures,
+        self, text: str, parsed: dict[str, Any], rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
+        """
+        ACTION_TARGET_TRIPLET：语义角色三元组检测。
+
+        V5.3: 支持 match_mode 参数；补被动语态（被字句）；清理 .get() 死代码。
+        """
         p = rule.params
-        if isinstance(p, ActionTargetTripletParams):
-            action_verbs:    list[str] = p.action_verbs
-            target_entities: list[str] = p.target_entities
-        else:
-            action_verbs    = p.get("action_verbs", [])
-            target_entities = p.get("target_entities", [])
+        action_verbs:    list[str] = p.action_verbs
+        target_entities: list[str] = p.target_entities
+        match_mode:     MatchMode = getattr(p, "match_mode", MatchMode.SUBSTR)
         if not action_verbs or not target_entities:
             return
 
-        hit_verbs = [v for v in action_verbs if v in text]
-        hit_targets = [t for t in target_entities if t in text]
+        tokens      = parsed.get("tokens", [])
+        nlp_backend = feats.nlp_backend
 
-        # ── 依存句法增强：兼容 VOB, FOB 以及“把”字句(POB) ──
-        tokens: list[str]            = parsed.get("tokens", [])
-        dep:    list[tuple[int, str]] = parsed.get("dep", [])
+        hit_verbs   = [v for v in action_verbs
+                       if self._match_keyword(v, text, tokens, nlp_backend, match_mode)]
+        hit_targets = [t for t in target_entities
+                       if self._match_keyword(t, text, tokens, nlp_backend, match_mode)]
+
+        # ── 依存句法增强：兼容 VOB, FOB, "把"字句(POB) 及"被"字句(SBV) ──
+        dep: list[tuple[int, str]] = parsed.get("dep", [])
 
         syntactic_confirm = False
         if dep and tokens and hit_verbs and hit_targets:
@@ -790,27 +862,41 @@ class SyntaxFeatureExtractor:
                 head_text  = tokens[head]
 
                 # 🎯 场景 1 & 2：直接宾语 (VOB) 或 前置宾语 (FOB)
-                # 例如：“输入(head) 验证码(child)” 或 “验证码(child) 输入(head)了吗”
+                # 例如："输入(head) 验证码(child)" 或 "验证码(child) 输入(head)了吗"
                 if rel in ("VOB", "FOB"):
                     if head_text in hit_verbs and child_text in hit_targets:
                         syntactic_confirm = True
                         break
 
-                # 🎯 场景 3：“把”字句 / 介词宾语结构 (POB 向上追溯 ADV)
-                # 例如：“把(head) 验证码(child) 发(prep_head) 给我”
+                # 🎯 场景 3："把"字句 / 介词宾语结构 (POB 向上追溯 ADV)
+                # 例如："把(head) 验证码(child) 发(prep_head) 给我"
                 if rel == "POB":
-                    # 如果当前词是目标实体（如验证码），且它的父节点是“把”或“将”
+                    # 如果当前词是目标实体（如验证码），且它的父节点是"把"或"将"
                     if child_text in hit_targets and head_text in ("把", "将", "给"):
-                        # 向上追溯第二跳：找到“把”依附的核心动词
-                        prep_head_idx = dep[head][0] # “把”的父节点索引
-                        prep_rel      = dep[head][1] # “把”与父节点的关系
+                        # 向上追溯第二跳：找到"把"依附的核心动词
+                        prep_head_idx = dep[head][0] # "把"的父节点索引
+                        prep_rel      = dep[head][1] # "把"与父节点的关系
                         
                         if prep_head_idx < len(tokens):
                             prep_head_text = tokens[prep_head_idx]
-                            # 如果“把”是作为状语(ADV)依附在我们的高危动作词上(如"发")
+                            # 如果"把"是作为状语(ADV)依附在我们的高危动作词上(如"发")
                             if prep_rel == "ADV" and prep_head_text in hit_verbs:
                                 syntactic_confirm = True
                                 break
+
+                # 🎯 场景 4（V5.3 新增）："被"字句 / 被动语态
+                # 例如："验证码(SBV) 被(ADV) 输入了(HED)"
+                # LTP 标注：验证码 -SBV→ 输入(HED)，被 -ADV→ 输入(HED)
+                # 也覆盖"让/叫/给"被动标记
+                if rel == "SBV" and child_text in hit_targets:
+                    # 检查同一个 head（动词）下是否有"被/让/叫/给"作 ADV
+                    has_passive_marker = any(
+                        head2 == head and rel2 == "ADV" and tokens[j] in ("被", "让", "叫", "给")
+                        for j, (head2, rel2) in enumerate(dep)
+                    )
+                    if has_passive_marker and head_text in hit_verbs:
+                        syntactic_confirm = True
+                        break
 
         # ── 降级判定与证据组装（保持不变） ──
         if hit_verbs and hit_targets:
@@ -835,9 +921,8 @@ class SyntaxFeatureExtractor:
 
     # ── V5.2 新增：通用轻量级关键字提取器 ──────────────────
 
-    @staticmethod
     def _extract_simple_keywords(
-        text: str, rule: SyntaxRuleConfig, feats: NlpFeatures
+        self, text: str, parsed: dict[str, Any], rule: SyntaxRuleConfig, feats: NlpFeatures
     ) -> None:
         """
         通用字符串集合匹配提取器。
@@ -848,16 +933,20 @@ class SyntaxFeatureExtractor:
           IDENTITY_IMPERSONATION / CHANNEL_SHIFTING
 
         统一使用 SimpleKeywordsParams.keywords 作为匹配词库。
+
+        V5.3: 支持 match_mode 参数，默认 SUBSTR 向后兼容。
         """
         p = rule.params
-        keywords: list[str] = (
-            p.keywords if isinstance(p, SimpleKeywordsParams)
-            else p.get("keywords", [])
-        )
+        keywords:   list[str] = p.keywords
+        match_mode: MatchMode = getattr(p, "match_mode", MatchMode.SUBSTR)
         if not keywords:
             return
 
-        hit_words = [kw for kw in keywords if kw in text]
+        tokens      = parsed.get("tokens", [])
+        nlp_backend = feats.nlp_backend
+
+        hit_words = [kw for kw in keywords
+                     if self._match_keyword(kw, text, tokens, nlp_backend, match_mode)]
         if hit_words:
             feats.set_feature(rule.feature_name, True)
             if rule.evidence_key:

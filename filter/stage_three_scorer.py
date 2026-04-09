@@ -390,14 +390,20 @@ class IntelligenceScorer:
                   条件：该主题意图被命中 AND 对应硬特征为 True
           Step C：记录命中的 topic_family（供跨族复合加分使用）
 
+        V5.3 变更：
+          - 消费 confidence_discount：rule_based 后端时非独立探针矩阵加分衰减
+          - 矩阵命中计数梯度：多矩阵命中时首矩阵满分，后续递减
+
         返回：命中的主题族集合（去重）
         """
         hit_families: set[str] = set()
+        nlp_backend: str = agent_nlp_feats.get("nlp_backend", "rule_based")
 
         for topic_id, topic_def in self._high_risk_topics.items():
             has_soft_intent = topic_id in all_intents
             topic_hit = False
             matrix_hit = False
+            combo_hit_count = 0  # V5.3: 矩阵命中计数（用于梯度加分）
 
             # Step B：矩阵组合扫描 (优先判断矩阵，不再提前 continue)
             for combo in topic_def.scoring_rules.matrix_combinations:
@@ -414,13 +420,25 @@ class IntelligenceScorer:
                     triggered = True  
 
                 if triggered:
+                    # V5.3: 计算实际加分
+                    actual_delta = combo.bonus_score
+                    # 梯度加分：第2个矩阵起递减 20%（避免单主题矩阵堆叠过多加分）
+                    combo_hit_count += 1
+                    if combo_hit_count > 1:
+                        actual_delta = int(actual_delta * max(0.4, 1.0 - 0.2 * (combo_hit_count - 1)))
+                    # confidence_discount：rule_based 后端 + 非独立探针 → 衰减
+                    if not combo.is_independent and nlp_backend == "rule_based":
+                        actual_delta = int(actual_delta * topic_def.scoring_rules.confidence_discount)
+
                     ctx.apply(
-                        delta  = combo.bonus_score,
+                        delta  = actual_delta,
                         tag    = combo.bonus_tag,
                         reason = (
                             f"矩阵命中 [{'!' if combo.requires_absence else ''}{combo.syntax_feature}] "
                             f"{'(独立触发)' if combo.is_independent else '× [' + topic_id + ']'} "
-                            f"→ {combo.bonus_score:+d}"
+                            f"→ {actual_delta:+d}"
+                            f"{' [discount=' + str(topic_def.scoring_rules.confidence_discount) + ']' if not combo.is_independent and nlp_backend == 'rule_based' else ''}"
+                            f"{' [梯度×' + str(max(0.4, 1.0 - 0.2 * (combo_hit_count - 1)))[:4] + ']' if combo_hit_count > 1 else ''}"
                         ),
                     )
                     matrix_hit = True

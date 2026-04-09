@@ -46,10 +46,11 @@ import re
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
+from typing import Literal
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 枚举：主题类别 & 句法规则类型
+# 枚举：主题类别 & 句法规则类型 & 匹配模式
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class TopicCategory(str, Enum):
@@ -152,6 +153,20 @@ class SyntaxRuleType(str, Enum):
     # 产出: feature_name → bool
 
 
+class MatchMode(str, Enum):
+    """
+    V5.3 关键词匹配模式：控制纯字符串提取器的词边界策略。
+
+    SUBSTR        : 子串包含（kw in text），向后兼容，默认模式
+    EXACT_WORD    : 精确词匹配 — LTP/HanLP 后端使用分词结果（kw in tokens），
+                    rule_based 后端因 tokens 为逐字拆分不可用，自动退回单字边界正则
+    REGEX_BOUNDARY: 中文词边界正则 — 单字关键词要求前后不是中文字符/\\w，
+                    多字关键词退回 SUBSTR（多字本身误报率低）
+    """
+    SUBSTR         = "substr"
+    EXACT_WORD     = "exact_word"
+    REGEX_BOUNDARY = "regex_boundary"
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Pydantic 强类型参数契约
@@ -178,6 +193,7 @@ class NerDensityParams(BaseModel):
 class KeywordCoocParams(BaseModel):
     """KEYWORD_COOC 参数：多组关键词集合"""
     keyword_sets: list[list[str]] = Field(..., min_length=1, description="关键词分组，每组至少一个列表")
+    match_mode:   MatchMode       = Field(default=MatchMode.SUBSTR, description="匹配模式：substr/exact_word/regex_boundary")
 
     @field_validator("keyword_sets")
     @classmethod
@@ -199,20 +215,24 @@ class VerbEntitySparsityParams(BaseModel):
 class IsolationRequestParams(BaseModel):
     """ISOLATION_REQUEST 参数：隔离/阻断指令词库"""
     isolation_keywords: list[str] = Field(..., min_length=1, description="隔离/阻断指令词库")
+    match_mode:         MatchMode = Field(default=MatchMode.SUBSTR, description="匹配模式")
 
 class MicroActionCommandParams(BaseModel):
     """MICRO_ACTION_COMMAND 参数：设备/操作微指令词库"""
     device_action_keywords: list[str] = Field(..., min_length=1, description="设备/操作微指令词库")
+    match_mode:             MatchMode = Field(default=MatchMode.SUBSTR, description="匹配模式")
 
 class ConditionalThreatParams(BaseModel):
     """CONDITIONAL_THREAT 参数：条件从句 + 威胁主句"""
     condition_clauses: list[str] = Field(..., min_length=1, description="条件从句词库")
     threat_clauses:   list[str] = Field(..., min_length=1, description="威胁主句词库")
+    match_mode:       MatchMode = Field(default=MatchMode.SUBSTR, description="匹配模式")
 
 class ActionTargetTripletParams(BaseModel):
     """ACTION_TARGET_TRIPLET 参数：施事动词 + 受事实体"""
     action_verbs:    list[str] = Field(..., min_length=1, description="施事动词列表")
     target_entities: list[str] = Field(..., min_length=1, description="受事实体列表")
+    match_mode:     MatchMode = Field(default=MatchMode.SUBSTR, description="匹配模式")
 
 class SimpleKeywordsParams(BaseModel):
     """
@@ -220,7 +240,8 @@ class SimpleKeywordsParams(BaseModel):
     用于 TEMPORAL_URGENCY / PRIVACY_INTRUSION / EMOTIONAL_MANIPULATION /
     IDENTITY_IMPERSONATION / CHANNEL_SHIFTING 等纯字符串匹配规则。
     """
-    keywords: list[str] = Field(..., min_length=1, description="关键字词库")
+    keywords:   list[str] = Field(..., min_length=1, description="关键字词库")
+    match_mode: MatchMode = Field(default=MatchMode.SUBSTR, description="匹配模式")
 
 
 # ── 映射表：SyntaxRuleType → Pydantic 模型类 ────────────────
@@ -767,15 +788,39 @@ _TOPIC_DRUG_CHAIN = TopicDefinition(
                 ],
             ),
         ),
+        # V5.3 新增：毒品交易动宾三元组（LTP 增强检测"出货→克"等暗语结构）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.ACTION_TARGET_TRIPLET,
+            feature_name = "has_drug_triplet",
+            evidence_key = "drug_triplet_evidence",
+            params = ActionTargetTripletParams(
+                action_verbs=["拿", "发", "走", "带", "出货", "拿货", "接货", "送货", "走货"],
+                target_entities=["肉", "冰", "货", "手", "克", "包", "份", "K粉", "草", "丸子"],
+                match_mode=MatchMode.EXACT_WORD,  # V5.3: "走"不能匹配"走路"
+            ),
+        ),
+        # V5.3 新增：交易链胁迫（"不付→断货/涨价"）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.CONDITIONAL_THREAT,
+            feature_name = "has_drug_chain_threat",
+            evidence_key = "drug_chain_threat_evidence",
+            params = ConditionalThreatParams(
+                condition_clauses=["不付", "不发货", "不打款", "不转账", "没钱"],
+                threat_clauses=["断货", "涨价", "不送了", "没货", "终止合作"],
+                match_mode=MatchMode.SUBSTR,  # 短语级匹配，子串包含即可
+            ),
+        ),
     ],
     scoring_rules = ScoringRules(
         standalone_score = 12,     # V5.2: 适度抬高（有矩阵支撑）
         standalone_tag   = "has_drug_chain",
         matrix_combinations = [
-            MatrixCombination("has_drug_quantity",   18, "drug_quantity_chain"),
-            MatrixCombination("high_entity_density",  8, "drug_chain_dense"),
-            MatrixCombination("has_financial_flow",  22, "drug_chain_financial_flow"),  # V5.2: 交易链+资金流向=高危
-            MatrixCombination("has_channel_shifting", 18, "drug_chain_covert_channel"),  # V5.2: 交易链+渠道转移
+            MatrixCombination("has_drug_quantity",       18, "drug_quantity_chain"),
+            MatrixCombination("high_entity_density",      8, "drug_chain_dense"),
+            MatrixCombination("has_financial_flow",      22, "drug_chain_financial_flow"),  # V5.2: 交易链+资金流向=高危
+            MatrixCombination("has_channel_shifting",    18, "drug_chain_covert_channel"),  # V5.2: 交易链+渠道转移
+            MatrixCombination("has_drug_triplet",        20, "drug_chain_action_target"),   # V5.3: 交易动宾结构
+            MatrixCombination("has_drug_chain_threat",   18, "drug_chain_coercion"),        # V5.3: 交易链胁迫
         ],
     ),
 )
@@ -804,16 +849,16 @@ _TOPIC_COERCIVE_ORG_CONTROL = TopicDefinition(
     threshold   = 0.74,
         bge_anchors=[],
     syntax_rules = [
-        # 🚨 缺陷 3 修复：收紧硬句法，仅保留绝对胁迫词，禁止模糊匹配
+        # V5.3: 替换 KEYWORD_COOC 为 CONDITIONAL_THREAT（句法确认条件胁迫结构）
         SyntaxRuleConfig(
-            rule_type    = SyntaxRuleType.KEYWORD_COOC,
+            rule_type    = SyntaxRuleType.CONDITIONAL_THREAT,
             feature_name = "has_coercive_threat",
-            params = KeywordCoocParams(
-                keyword_sets=[
-                    ["如果不", "否则", "一旦"],
-                ],
+            evidence_key = "coercive_threat_evidence",
+            params = ConditionalThreatParams(
+                condition_clauses=["如果不", "否则", "一旦", "除非"],
+                threat_clauses=["惩罚", "报应", "后果", "灾难", "灾祸", "驱逐", "出事"],
+                match_mode=MatchMode.REGEX_BOUNDARY,  # V5.3: 词边界保护
             ),
-            evidence_key = None,
         ),
         # 检测「财务勒索」：金融词 + 威胁/强迫词共现
         SyntaxRuleConfig(
@@ -827,6 +872,7 @@ _TOPIC_COERCIVE_ORG_CONTROL = TopicDefinition(
                     ["必须", "否则", "不然", "要不然", "后果", "惩罚",
                      "报应", "灾祸", "不交就"],
                 ],
+                match_mode=MatchMode.REGEX_BOUNDARY,  # V5.3: "交"→"交警" 误报保护
             ),
             evidence_key = None,
         ),
@@ -841,6 +887,7 @@ _TOPIC_COERCIVE_ORG_CONTROL = TopicDefinition(
                     # 集合 B：惩罚/后果词
                     ["惩罚", "报应", "后果", "驱逐", "出事", "灾难"],
                 ],
+                match_mode=MatchMode.REGEX_BOUNDARY,  # V5.3: 词边界保护
             ),
             evidence_key = None,
         ),
@@ -898,6 +945,7 @@ _TOPIC_EXTREMIST_PROPAGANDA = TopicDefinition(
             params = ActionTargetTripletParams(
                 action_verbs=["捐", "献", "交", "奉献", "供养", "布施", "奉献给", "上交"],
                 target_entities=["会费", "善款", "诚意金", "奉献金", "功德", "香火钱", "组织"],
+                match_mode=MatchMode.REGEX_BOUNDARY,  # V5.3: "交"→"交警" 误报保护
             ),
         ),
         # V5.2 新增：渠道转移（邪教传播渠道控制）
@@ -913,15 +961,41 @@ _TOPIC_EXTREMIST_PROPAGANDA = TopicDefinition(
                 ],
             ),
         ),
+        # V5.3 新增：邪教条件胁迫（"不信→天谴/报应"，精神控制核心句法）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.CONDITIONAL_THREAT,
+            feature_name = "has_extremist_conditional_threat",
+            evidence_key = "extremist_conditional_threat_evidence",
+            params = ConditionalThreatParams(
+                condition_clauses=["不信", "违背", "退出", "反对", "不服从", "质疑"],
+                threat_clauses=["天谴", "报应", "神明惩罚", "灾难降临", "审判", "毁灭", "下地狱"],
+                match_mode=MatchMode.SUBSTR,  # 短语级匹配
+            ),
+        ),
+        # V5.3 新增：隔离请求（邪教信息阻断：切断外部信息源）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.ISOLATION_REQUEST,
+            feature_name = "has_extremist_isolation",
+            evidence_key = "extremist_isolation_evidence",
+            params = IsolationRequestParams(
+                isolation_keywords=[
+                    "不要告诉家人", "不要跟别人说", "家人不理解",
+                    "世俗", "外面的人不懂", "不要上网查",
+                ],
+                match_mode=MatchMode.SUBSTR,
+            ),
+        ),
     ],
     scoring_rules = ScoringRules(
         standalone_score = 15,
         standalone_tag   = "extremist_propaganda",
         matrix_combinations = [
-            MatrixCombination("high_entity_density",            8, "extremist_with_dense_entities"),
-            MatrixCombination("has_emotional_manipulation",    20, "extremist_mind_control"),         # V5.2
-            MatrixCombination("has_extremist_financial_flow",  25, "extremist_financial_harvest"),     # V5.2
-            MatrixCombination("has_extremist_channel_shift",   18, "extremist_channel_control"),       # V5.2
+            MatrixCombination("high_entity_density",                    8, "extremist_with_dense_entities"),
+            MatrixCombination("has_emotional_manipulation",           20, "extremist_mind_control"),         # V5.2
+            MatrixCombination("has_extremist_financial_flow",         25, "extremist_financial_harvest"),     # V5.2
+            MatrixCombination("has_extremist_channel_shift",          18, "extremist_channel_control"),       # V5.2
+            MatrixCombination("has_extremist_conditional_threat",     20, "extremist_coercion"),              # V5.3
+            MatrixCombination("has_extremist_isolation",              18, "extremist_information_blockade"),  # V5.3
         ],
     ),
 )
@@ -1012,13 +1086,36 @@ _TOPIC_INCITEMENT_TO_VIOLENCE = TopicDefinition(
                 ],
             ),
         ),
+        # V5.3 新增：祈使句检测（暴力煽动中的指令性句式："给我打！""冲！"）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.IMPERATIVE_SYNTAX,
+            feature_name = "has_violence_imperative",
+            evidence_key = "violence_imperative_evidence",
+            params = ImperativeSyntaxParams(
+                second_person=["你", "你们", "您", "大家", "兄弟们"],
+                urgency_adverbs=["给我", "马上", "立刻", "冲", "上", "打", "杀"],
+            ),
+        ),
+        # V5.3 新增：暴力动宾三元组（"打→他们/人"，LTP 增强确认暴力指令）
+        SyntaxRuleConfig(
+            rule_type    = SyntaxRuleType.ACTION_TARGET_TRIPLET,
+            feature_name = "has_violence_triplet",
+            evidence_key = "violence_triplet_evidence",
+            params = ActionTargetTripletParams(
+                action_verbs=["打", "砸", "烧", "杀", "冲", "砍", "围"],
+                target_entities=["他们", "他", "她", "人", "店", "车", "门", "房子"],
+                match_mode=MatchMode.EXACT_WORD,  # V5.3: "打"不能匹配"打电话"
+            ),
+        ),
     ],
     scoring_rules = ScoringRules(
         standalone_score = 15,
         standalone_tag   = "incitement_to_violence",
         matrix_combinations = [
-            MatrixCombination("high_entity_density",  8, "violence_with_dense_entities"),
-            MatrixCombination("has_violence_urgency", 20, "violence_urgent_action"),  # V5.2
+            MatrixCombination("high_entity_density",       8, "violence_with_dense_entities"),
+            MatrixCombination("has_violence_urgency",     20, "violence_urgent_action"),       # V5.2
+            MatrixCombination("has_violence_imperative",  22, "violence_imperative_command"),   # V5.3
+            MatrixCombination("has_violence_triplet",     20, "violence_action_target"),        # V5.3
         ],
     ),
 )
