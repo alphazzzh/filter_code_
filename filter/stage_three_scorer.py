@@ -890,6 +890,24 @@ class IntelligenceScorer:
 
         final_score = max(floor_score, min(_SCORE_MAX, ctx.score))
 
+        # ==========================================================
+        # 针对 LangGraph State 瘦身的动态主题融合逻辑
+        # ==========================================================
+        dynamic_search = result.metadata.get("dynamic_search", {})
+        if dynamic_search.get("matched"):
+            topic_queried = dynamic_search.get("topic_queried", "unknown")
+            # 保证只要命中主题，分数保底提升至 70（如果已经是80/100分的诈骗则不降级）
+            final_score = max(final_score, 70)
+            
+            # 将命中标签注入，并在落盘的事件日志里记录下来（方便后期排查）
+            ctx.tags.add(f"dynamic_topic_matched_{topic_queried}")
+            ctx.events.append({
+                "delta": 0, 
+                "tag": "dynamic_topic_matched", 
+                "reason": f"LangGraph融合：动态主题 [{topic_queried}] 检索命中，基础分数保底提升至 70"
+            })
+        # ==========================================================
+
         # ── 标签降维压制（Hierarchical Tag Suppression）──
         # 在输出前执行：高危意图存在时，清除底层噪音标签，防止语义冲突
         suppressed_tags = IntelligenceScorer._apply_tag_suppression(ctx.tags)

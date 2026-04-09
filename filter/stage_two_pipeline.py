@@ -941,21 +941,24 @@ class StageTwoPipeline:
         # ── 2. 动态搜索轨道（鲁棒整合 + 滑动窗口切块） ──
         dynamic_search_result = None
 
-        # 鲁棒性设计 1：安全的字典读取
-        dynamic_topic = extra_metadata.get("dynamic_topic") if extra_metadata else None
+        raw_topic = extra_metadata.get("dynamic_topic") if extra_metadata else None
         
-        if dynamic_topic and isinstance(dynamic_topic, str):
-            # 清洗对话文本，剔除无意义的语气词 "嗯", "啊"
+        # 🛡️ 类型归一化：无论传入的是单字符串，还是列表，统统转成干净的 list[str]
+        topics_to_search = []
+        if isinstance(raw_topic, str) and raw_topic.strip():
+            topics_to_search = [raw_topic.strip()]
+        elif isinstance(raw_topic, list):
+            topics_to_search = [str(t).strip() for t in raw_topic if str(t).strip()]
+
+        if topics_to_search:
+            # 清洗对话文本，剔除无意义的语气词
             valid_turns = [
                 t for t in labeled_turns 
                 if not t.is_backchannel and len(t.merged_text.strip()) > 1
             ]
             
             if valid_turns:
-                # =========================================================
-                # 【RAG 优化方向二：滑动窗口上下文重组 (Contextual Chunking)】
-                # 设定窗口大小为 5 句话，步长为 2 句话，保留上下文交叉
-                # =========================================================
+                # 【RAG 优化方向二：滑动窗口上下文重组】(此处性能开销极小，只做切片)
                 window_size = 5
                 stride = 2
                 search_chunks = []
@@ -964,21 +967,29 @@ class StageTwoPipeline:
                     window = valid_turns[i : i + window_size]
                     if not window:
                         break
-                    # 拼接带说话人标识的完整上下文，例如： "[0] 喂你好 [1] 你的快递到了"
                     chunk_text = " ".join([f"[{t.speaker_id}] {t.merged_text.strip()}" for t in window])
                     search_chunks.append(chunk_text)
 
-                # 调用雷达进行搜索，传入拼接好的上下文块
-                dynamic_search_result = self._radar.dynamic_search(
-                    search_chunks=search_chunks, 
-                    dynamic_topic=dynamic_topic,
-                    default_threshold=0.65,
-                    top_k=1  
-                )
+                # 🚀 核心升级：多主题独立搜索，拒绝语义稀释！
+                best_result = None
+                for single_topic in topics_to_search:
+                    # 每个主题拥有独立的纯净向量，互不干扰
+                    res = self._radar.dynamic_search(
+                        search_chunks=search_chunks, 
+                        dynamic_topic=single_topic,
+                        default_threshold=0.40,
+                        top_k=1  
+                    )
+                    
+                    # 内部竞价：保留得分最高的那个主题的情报
+                    current_score = res.get("max_score", 0.0)
+                    if not best_result or current_score > best_result.get("max_score", 0.0):
+                        best_result = res
+                
+                dynamic_search_result = best_result
             else:
-                # 对话全是废话/静音，直接返回未匹配
                 dynamic_search_result = {
-                    "topic_queried": dynamic_topic,
+                    "topic_queried": str(topics_to_search),
                     "matched": False,
                     "max_score": 0.0,
                     "top_matches": [],

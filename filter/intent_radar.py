@@ -381,9 +381,15 @@ class IntentRadar:
             query_vec = self._model.encode([query_instruction])["dense_vecs"][0]
             
             # 2. 对所有滑动窗口块进行向量化
-            doc_vecs = self._model.encode(search_chunks)
-
-            if doc_vecs.ndim == 1:
+            encoded_docs = self._model.encode(search_chunks)
+            
+            # 增加字典解析：兼容 BGE-M3 的字典输出和传统模型的数组输出
+            if isinstance(encoded_docs, dict) and 'dense_vecs' in encoded_docs:
+                doc_vecs = encoded_docs['dense_vecs']
+            else:
+                doc_vecs = encoded_docs
+                
+            if doc_vecs.ndim == 1:   # ✅ 现在 doc_vecs 是纯粹的 Numpy 数组了
                 doc_vecs = doc_vecs.reshape(1, -1)
                 
             # 3. 计算余弦相似度矩阵

@@ -1006,7 +1006,7 @@ _TOPIC_INCITEMENT_TO_VIOLENCE = TopicDefinition(
             evidence_key = "violence_urgency_evidence",
             params = SimpleKeywordsParams(
                 keywords=[
-                    "今晚", "明天", "趁现在", "就在今天", "马上行动",
+                    "趁现在", "就在今天", "马上行动",
                     "时机已到", "不能再等", "时间紧迫", "抓紧时间",
                     "tonight", "right now", "before it's too late",
                 ],
@@ -1163,7 +1163,7 @@ _TOPIC_E_COMMERCE_CS = TopicDefinition(
             rule_type    = SyntaxRuleType.REGEX_PATTERN,
             feature_name = "has_financial_scam_keywords",
             params = RegexPatternParams(
-                pattern=r"(备用金|白条|金条|借呗|微粒贷).{0,30}(额度|关闭|激活|服务费|违约金|征信)|(点击|打开).{0,10}(链接|网址|屏幕共享)|(京东|金融|淘宝|客服).{0,20}(注销|额度|回执)"
+                pattern=r"(备用金|白条|金条|借呗|微粒贷|百万保障).{0,30}(额度|关闭|激活|服务费|违约金|征信)|(京东|金融|淘宝|客服|银联).{0,20}(注销|额度|回执|屏幕共享|共享屏幕)"
             )
         ),
         # V5.1 新增：服从性测试微动作指令（电商客服特供）
@@ -1280,14 +1280,15 @@ _TOPIC_MASS_GRIEVANCE = TopicDefinition(
     category    = TopicCategory.HIGH_RISK,
     topic_family= "grievance",
     description = "涉军/群体维权与涉稳信访",
-    threshold   = 0.68,
+    threshold   = 0.72,
         bge_anchors=[],
     scoring_rules = ScoringRules(
         standalone_score = 12,    # V5.1: 压低（原25）
         standalone_tag   = "social_grievance_petition",
         matrix_combinations = [
             MatrixCombination("coordinated_broadcast",  20, "CRITICAL_MASS_INCIDENT_MOBILIZATION"),   # V5.1: 压低（原40）
-            MatrixCombination("incitement_to_violence", 20, "CRITICAL_VIOLENT_PROTEST_RISK"),          # V5.1: 压低（原40）
+            MatrixCombination("incitement_to_violence", 20, "CRITICAL_VIOLENT_PROTEST_RISK"), 
+            MatrixCombination("is_business_sparse",    -20, "false_positive_grievance_noise"),         # V5.1: 压低（原40）
         ],
     ),
 )
