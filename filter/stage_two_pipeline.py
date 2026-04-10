@@ -160,6 +160,10 @@ class _NlpBackend:
         """
         raise NotImplementedError
 
+    def analyze_batch(self, texts: list[str]) -> list[dict[str, Any]]:
+        """批量分析，默认逐条调用 analyze()，子类可覆盖以提升吞吐。"""
+        return [self.analyze(t) for t in texts]
+
 
 class _LtpBackend(_NlpBackend):
     """LTP 4.x HTTP 微服务后端，标签：HED/SBV/ADV/VOB。
@@ -191,6 +195,10 @@ class _LtpBackend(_NlpBackend):
     def analyze(self, text: str) -> dict[str, Any]:
         """调用微服务 /analyze 接口，返回与旧版 _LtpBackend.analyze 兼容格式。"""
         return self._client.analyze(text)
+
+    def analyze_batch(self, texts: list[str]) -> list[dict[str, Any]]:
+        """调用微服务批量接口，1 次 HTTP 请求替代 N 次。"""
+        return self._client.analyze_batch(texts)
 
 
 class _HanLpBackend(_NlpBackend):
@@ -225,6 +233,28 @@ class _HanLpBackend(_NlpBackend):
             (e, t) for e, t, *_ in ner_raw
         ]
         return {"tokens": tokens, "dep": dep, "ner": ner}
+
+    def analyze_batch(self, texts: list[str]) -> list[dict[str, Any]]:
+        """HanLP 原生支持 batch 输入，1 次调用替代 N 次。"""
+        results = self._hanlp(texts)
+        batch_output: list[dict[str, Any]] = []
+        n = len(texts)
+        tok_all  = results.get("tok/fine", [])
+        dep_all  = results.get("dep", [])
+        ner_all  = results.get("ner/ontonotes", [])
+        for i in range(n):
+            tokens  = tok_all[i] if i < len(tok_all) else []
+            dep_raw = dep_all[i] if i < len(dep_all) else []
+            dep: list[tuple[int, str]] = [
+                (h - 1, self._UD_MAP.get(r.lower(), r.upper()))
+                for h, r in dep_raw
+            ]
+            ner_raw = ner_all[i] if i < len(ner_all) else []
+            ner: list[tuple[str, str]] = [
+                (e, t) for e, t, *_ in ner_raw
+            ]
+            batch_output.append({"tokens": tokens, "dep": dep, "ner": ner})
+        return batch_output
 
 
 class _RuleBasedFallback(_NlpBackend):
@@ -355,6 +385,50 @@ class SyntaxFeatureExtractor:
 
         parsed: dict[str, Any] = self._backend.analyze(text) if needs_nlp else {}
 
+        self._apply_rules(text, parsed, feats)
+
+        return feats
+
+    def extract_batch(self, texts: list[str]) -> list[NlpFeatures]:
+        """
+        批量提取特征：将 N 次 NLP HTTP 请求压缩为 1 次。
+
+        典型场景：process_conversation 中 full_text + 各角色文本，
+        原需 (1+N) 次请求 → 现仅需 1 次批量请求。
+        """
+        # 判断是否需要 NLP
+        needs_nlp = any(
+            r.rule_type in (
+                SyntaxRuleType.NER_DENSITY,
+                SyntaxRuleType.IMPERATIVE_SYNTAX,
+                SyntaxRuleType.VERB_ENTITY_SPARSITY,
+                SyntaxRuleType.CONDITIONAL_THREAT,
+                SyntaxRuleType.ACTION_TARGET_TRIPLET,
+                SyntaxRuleType.FINANCIAL_FLOW,
+            )
+            for r in self._rules.values()
+        ) or self._needs_nlp_for_match_mode()
+
+        # 核心：一次性将所有文本送入 NLP 后端
+        if needs_nlp:
+            parsed_batch = self._backend.analyze_batch(texts)
+        else:
+            parsed_batch = [{}] * len(texts)
+
+        results: list[NlpFeatures] = []
+        for text, parsed in zip(texts, parsed_batch):
+            if not text.strip():
+                results.append(NlpFeatures(nlp_backend=self._backend.name))
+                continue
+
+            feats = NlpFeatures(nlp_backend=self._backend.name)
+            self._apply_rules(text, parsed, feats)
+            results.append(feats)
+
+        return results
+
+    def _apply_rules(self, text: str, parsed: dict[str, Any], feats: NlpFeatures) -> None:
+        """对单条文本应用全部规则（extract 和 extract_batch 共用）。"""
         for rule in self._rules.values():
             if rule.rule_type == SyntaxRuleType.QUANTITY_REGEX:
                 self._extract_quantity_regex(text, rule, feats)
@@ -371,11 +445,9 @@ class SyntaxFeatureExtractor:
             elif rule.rule_type == SyntaxRuleType.KEYWORD_COOC:
                 self._extract_keyword_cooc(text, parsed, rule, feats)
 
-
             elif rule.rule_type == SyntaxRuleType.VERB_ENTITY_SPARSITY:
                 self._extract_verb_entity_sparsity(parsed, rule, feats)
 
-            # ── V5.1 新增：行为学/心理学特征提取器 ────────────
             elif rule.rule_type == SyntaxRuleType.ISOLATION_REQUEST:
                 self._extract_isolation_request(text, parsed, rule, feats)
 
@@ -388,7 +460,6 @@ class SyntaxFeatureExtractor:
             elif rule.rule_type == SyntaxRuleType.ACTION_TARGET_TRIPLET:
                 self._extract_action_target_triplet(text, parsed, rule, feats)
 
-            # ── V5.2 新增：多维行为/心理/交易特征提取器 ─────────
             elif rule.rule_type == SyntaxRuleType.TEMPORAL_URGENCY:
                 self._extract_simple_keywords(text, parsed, rule, feats)
 
@@ -405,10 +476,7 @@ class SyntaxFeatureExtractor:
                 self._extract_simple_keywords(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.FINANCIAL_FLOW:
-                # 复用三元组提取器（LTP 增强 + 正则降级双路径）
                 self._extract_action_target_triplet(text, parsed, rule, feats)
-
-        return feats
 
     # ── V5.3 词边界匹配核心方法 ──────────────────────────────────
 
@@ -996,16 +1064,31 @@ class StageTwoPipeline:
         )
 
         # ── 硬句法轨道 ────────────────────────────────────────
-        # 提取全局特征
+        # 批量收集：full_text + 各角色文本 → 1 次 NLP 请求替代 (1+N) 次
         full_text: str = " ".join(t.merged_text for t in labeled_turns if not t.is_backchannel and t.merged_text.strip())
-        global_nlp_feats: NlpFeatures = self._syntax.extract(full_text) if full_text.strip() else NlpFeatures(nlp_backend=self._syntax._backend.name)
 
-        # 提取按角色特征 (防角色污染)
-        speaker_nlp_feats: dict[str, dict[str, Any]] = {}
+        texts_to_analyze: list[str] = []
+        speaker_ids: list[str] = []
+
+        # 第一个元素：全局文本
+        texts_to_analyze.append(full_text)
+
+        # 后续元素：各角色文本
         for role_res in role_results:
             sid = role_res.speaker_id
             speaker_text = " ".join(t.merged_text for t in labeled_turns if t.speaker_id == sid and not t.is_backchannel and t.merged_text.strip())
-            speaker_nlp_feats[sid] = self._syntax.extract(speaker_text).to_dict() if speaker_text.strip() else NlpFeatures(nlp_backend=self._syntax._backend.name).to_dict()
+            texts_to_analyze.append(speaker_text)
+            speaker_ids.append(sid)
+
+        # O(1) 批量调用！
+        batch_feats = self._syntax.extract_batch(texts_to_analyze)
+
+        # 分发结果
+        global_nlp_feats: NlpFeatures = batch_feats[0] if full_text.strip() else NlpFeatures(nlp_backend=self._syntax._backend.name)
+        speaker_nlp_feats: dict[str, dict[str, Any]] = {}
+        for idx, sid in enumerate(speaker_ids):
+            speaker_text = texts_to_analyze[idx + 1]
+            speaker_nlp_feats[sid] = batch_feats[idx + 1].to_dict() if speaker_text.strip() else NlpFeatures(nlp_backend=self._syntax._backend.name).to_dict()
 
         
         # ── 2. 动态搜索轨道（鲁棒整合 + 滑动窗口切块） ──

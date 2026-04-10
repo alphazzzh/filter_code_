@@ -81,8 +81,8 @@ class FilterNode:
         else:
             logger.info("ℹ️ fasttext 未安装，跳过 LID 语种识别")
         
-        self.cpu_pool = ThreadPoolExecutor(max_workers=8)
-        self.gpu_semaphore = asyncio.Semaphore(4)
+        self.cpu_pool = ThreadPoolExecutor(max_workers=int(os.getenv("NODE_MAX_CONCURRENT", 64)))
+        self.gpu_semaphore = asyncio.Semaphore(int(os.getenv("NODE_MAX_CONCURRENT", 64)))
         
         # 确保日志目录存在
         os.makedirs(self.log_dir, exist_ok=True)

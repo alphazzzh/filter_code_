@@ -33,12 +33,15 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import re
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── 流水线模块 ────────────────────────────────────────────────
 # 阶段一：启发式特征提取与高危拦截
@@ -90,6 +93,8 @@ class PipelineConfig:
     # 漏斗路由：纯噪音记录直接丢弃
     # 控制台预览：每处理多少条打印一次摘要
     preview_every:   int  = 50
+    # 并发：本地 CSV 刷数据的线程数（0=串行，>0=并发）
+    max_workers:     int  = 0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -306,17 +311,126 @@ def _build_skip_result(conv_id: str) -> dict[str, Any]:
 # 主流程
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# 线程安全的输出锁
+_write_lock = threading.Lock()
+
+
+def _process_single_conversation(
+    conv_id: str,
+    raw_records: list[ASRRecord],
+    stage1: StageOneFilter,
+    stage2: StageTwoPipeline,
+    scorer: IntelligenceScorer,
+    bot_engine: BotConfidenceEngine,
+    voicemail_engine: AdvancedVoicemailDetector,
+    topo_engine: TopologyEngine,
+) -> dict[str, Any] | None:
+    """
+    处理单条会话的全流程（阶段一 → 路由 → 阶段二 → 打分）。
+    线程安全：可被 ThreadPoolExecutor 并发调用。
+    返回 intel 字典或 None（SKIP / 错误时）。
+    """
+    full_text = " ".join([r.raw_text for r in raw_records])
+    has_immunity = bool(RE_IMMUNITY.search(full_text))
+
+    if has_immunity:
+        logger.warning(f"[🔥 警报] conv={conv_id} 发现极高危免疫特征！强制保送！")
+
+    # ── 阶段一：逐条处理 ────────────────────────────
+    s1_records: list[ASRRecord] = []
+    for rec in raw_records:
+        try:
+            s1_rec = stage1.process(rec)
+            s1_records.append(s1_rec)
+        except Exception as exc:
+            logger.warning(f"[Stage1] conv={conv_id} rec={rec.record_id} 处理失败，跳过：{exc}")
+
+    if not s1_records:
+        return {"_skip": True, "type": "empty_s1"}
+
+    # ── 路由决策 ─────────────────────────────
+    route: str = _route_record(s1_records)
+
+    if route == RouteDecision.SKIP:
+        return {"_skip": True, "type": "skip", "conv_id": conv_id}
+
+    # 阶段一 metadata 透传
+    s1_aggregate_meta: dict[str, Any] = _aggregate_stage1_meta(s1_records)
+
+    if has_immunity:
+        s1_aggregate_meta["stage_one_critical_hit"] = True
+        s1_aggregate_meta["hit_keyword"] = "高危免疫特征"
+
+    # ── PASS 路径：阶段二 + 打分 ─────────────────────
+    try:
+        stage2_result: StageTwoResult = stage2.process_conversation(
+            conversation_id=conv_id,
+            records=s1_records,
+            extra_metadata={"stage_one": s1_aggregate_meta},
+        )
+    except Exception as exc:
+        logger.error(f"[Stage2] conv={conv_id} 处理失败，降级输出：{exc}", exc_info=True)
+        return {
+            "_error_fallback": True,
+            "conversation_id": conv_id,
+            "final_score": 50,
+            "tags": ["stage2_error_fallback"],
+            "track_type": "n/a",
+            "roles": {},
+            "interaction_summary": {},
+            "nlp_features_summary": {},
+            "score_breakdown": [{"delta": 0, "tag": "stage2_error", "reason": f"阶段二处理异常，降级兜底：{exc}"}],
+            "_route": "PASS",
+            "_error": str(exc),
+            "_processed_at": datetime.utcnow().isoformat(),
+        }
+
+    # ── 阶段三/四/五：打分 ────────────────────────────
+    intel: dict[str, Any] = scorer.evaluate(stage2_result)
+
+    topo_metrics = topo_engine.compute_metrics(stage2_result.dialogue_turns)
+    bot_result = bot_engine.evaluate(stage2_result, filler_word_rate=topo_metrics.filler_word_rate)
+    voicemail_result = voicemail_engine.evaluate(stage2_result, is_decoupled=topo_metrics.is_decoupled)
+
+    intel["bot_confidence"] = {
+        "bot_score": bot_result["bot_score"],
+        "bot_label": bot_result["bot_label"].value,
+        "veto_reason": bot_result["veto_reason"],
+        "details": bot_result["details"],
+    }
+    intel["voicemail_detection"] = {
+        "voicemail_score": voicemail_result["voicemail_score"],
+        "is_voicemail": voicemail_result["is_voicemail"],
+        "veto_reason": voicemail_result["veto_reason"],
+        "details": voicemail_result["details"],
+    }
+    intel["topology_metrics"] = {
+        "filler_word_rate": topo_metrics.filler_word_rate,
+        "max_sentence_length": topo_metrics.max_sentence_length,
+        "avg_sentence_length": topo_metrics.avg_sentence_length,
+        "is_decoupled": topo_metrics.is_decoupled,
+    }
+
+    intel["_route"] = "PASS"
+    intel["_processed_at"] = datetime.utcnow().isoformat()
+
+    return intel
+
 def run_pipeline(config: PipelineConfig) -> None:
     """
     流水线主函数，负责：
     1. 初始化三个阶段的处理器（进程内单例模式）
     2. 逐会话读取 CSV → 路由决策 → 阶段一 → 阶段二 → 打分 → 写出
     3. 统计漏斗各层数据量，最终打印运营摘要
+
+    V5.3: 支持 max_workers > 0 时并发处理（ThreadPoolExecutor），
+          max_workers = 0 时保持原有串行模式。
     """
     logger.info("=" * 60)
     logger.info("ASR 情报流水线启动")
     logger.info(f"  输入：{config.input_csv}")
     logger.info(f"  输出：{config.output_jsonl}")
+    logger.info(f"  并发：{'串行' if config.max_workers <= 0 else f'{config.max_workers} 线程'}")
     logger.info("=" * 60)
 
     # ── 初始化三个阶段的处理器 ────────────────────────────────
@@ -357,125 +471,88 @@ def run_pipeline(config: PipelineConfig) -> None:
 
     logger.info("[运行] 开始处理对话记录……")
 
-    with open(output_path, "w", encoding="utf-8") as out_f:
-        for conv_id, raw_records in _iter_csv_as_conversations(config.input_csv):
-            stats["total_conversations"] += 1
-            stats["total_records"]       += len(raw_records)
+    def _update_stats_and_write(out_f, result, conv_id, raw_records_len):
+        """根据 _process_single_conversation 返回值更新统计并写文件。线程安全。"""
+        stats["total_conversations"] += 1
+        stats["total_records"] += raw_records_len
 
-            full_text = " ".join([r.raw_text for r in raw_records])
-            has_immunity = bool(RE_IMMUNITY.search(full_text))
-            
-            if has_immunity:
-                logger.warning(f"[🔥 警报] conv={conv_id} 发现极高危免疫特征！强制保送！")
-            '''
-            elif RE_IVR_BOT.search(full_text):
-                logger.info(f"[🚫 拦截] conv={conv_id} 命中 IVR/机器客服废料，阶段零直接丢弃！")
-                stats["routed_skip"] += 1
-                continue
-            '''
+        if result is None:
+            return
 
-            # ── 阶段一：逐条处理 ────────────────────────────
-            s1_records: list[ASRRecord] = []
-            for rec in raw_records:
-                try:
-                    s1_rec = stage1.process(rec)
-                    s1_records.append(s1_rec)
-                except Exception as exc:
-                    logger.warning(
-                        f"[Stage1] conv={conv_id} rec={rec.record_id} "
-                        f"处理失败，跳过：{exc}"
-                    )
-
-            if not s1_records:
-                stats["routed_skip"] += 1
-                continue
-
-            # ── 路由决策：基于阶段一产出 ─────────────────────
-            route: str = _route_record(s1_records)
-
-            if route == RouteDecision.SKIP:
-                stats["routed_skip"] += 1
-                logger.debug(f"[SKIP] conv={conv_id}，极端噪声，已丢弃。")
-                skip_result = _build_skip_result(conv_id)
+        if result.get("_skip"):
+            stats["routed_skip"] += 1
+            if result.get("type") == "skip":
+                skip_result = _build_skip_result(result["conv_id"])
                 skip_result["_processed_at"] = datetime.utcnow().isoformat()
-                _write_json_line(out_f, skip_result)
-                continue
+                with _write_lock:
+                    _write_json_line(out_f, skip_result)
+            return
 
-            # 阶段一 metadata 透传：将汇总的阶段一信号注入给阶段二 extra_metadata
-            s1_aggregate_meta: dict[str, Any] = _aggregate_stage1_meta(s1_records)
-            
-            # 🚨 缺陷 1 修复：阶段一硬正则极高危透传
-            if has_immunity:
-                s1_aggregate_meta["stage_one_critical_hit"] = True
-                s1_aggregate_meta["hit_keyword"] = "高危免疫特征"
-
-            # ── PASS 路径：阶段二 + 打分 ─────────────────────
+        if result.get("_error_fallback"):
             stats["routed_pass"] += 1
-            try:
-                stage2_result: StageTwoResult = stage2.process_conversation(
-                    conversation_id = conv_id,
-                    records         = s1_records,
-                    extra_metadata  = {"stage_one": s1_aggregate_meta},
-                )
-                stats["stage2_processed"] += 1
-            except Exception as exc:
-                logger.error(
-                    f"[Stage2] conv={conv_id} 处理失败，降级输出：{exc}",
-                    exc_info=True,
-                )
-                fallback_result = {
-                    "conversation_id":     conv_id,
-                    "final_score":         50,
-                    "tags":                ["stage2_error_fallback"],
-                    "track_type":          "n/a",
-                    "roles":               {},
-                    "interaction_summary": {},
-                    "nlp_features_summary": {},
-                    "score_breakdown":     [{"delta": 0, "tag": "stage2_error", "reason": f"阶段二处理异常，降级兜底：{exc}"}],
-                    "_route":              "PASS",
-                    "_error":              str(exc),
-                    "_processed_at":       datetime.utcnow().isoformat(),
-                }
-                _write_json_line(out_f, fallback_result)
-                continue
+            with _write_lock:
+                _write_json_line(out_f, result)
+            return
 
-            # ── 阶段三/四/五：打分 ────────────────────────────
-            intel: dict[str, Any] = scorer.evaluate(stage2_result)
+        # 正常结果
+        stats["routed_pass"] += 1
+        stats["stage2_processed"] += 1
+        intel = result
 
-            # ── 阶段 3.5：多维置信度辅助判定 ──────────────────
-            topo_metrics = topo_engine.compute_metrics(stage2_result.dialogue_turns)
-            bot_result = bot_engine.evaluate(stage2_result, filler_word_rate=topo_metrics.filler_word_rate)
-            voicemail_result = voicemail_engine.evaluate(stage2_result, is_decoupled=topo_metrics.is_decoupled)
-
-            intel["bot_confidence"] = {
-                "bot_score": bot_result["bot_score"],
-                "bot_label": bot_result["bot_label"].value,
-                "veto_reason": bot_result["veto_reason"],
-                "details": bot_result["details"],
-            }
-            intel["voicemail_detection"] = {
-                "voicemail_score": voicemail_result["voicemail_score"],
-                "is_voicemail": voicemail_result["is_voicemail"],
-                "veto_reason": voicemail_result["veto_reason"],
-                "details": voicemail_result["details"],
-            }
-            intel["topology_metrics"] = {
-                "filler_word_rate": topo_metrics.filler_word_rate,
-                "max_sentence_length": topo_metrics.max_sentence_length,
-                "avg_sentence_length": topo_metrics.avg_sentence_length,
-                "is_decoupled": topo_metrics.is_decoupled,
-            }
-
-            intel["_route"]        = "PASS"
-            intel["_processed_at"] = datetime.utcnow().isoformat()
-
+        with _write_lock:
             _write_json_line(out_f, intel)
 
-            if intel["final_score"] >= 70:
-                stats["high_risk"] += 1
+        if intel.get("final_score", 0) >= 70:
+            stats["high_risk"] += 1
 
-            if stats["total_conversations"] % config.preview_every == 0:
-                _print_preview(intel)
+        if stats["total_conversations"] % config.preview_every == 0:
+            _print_preview(intel)
+
+    # ── 并发模式 ──────────────────────────────────────────────
+    if config.max_workers > 0:
+        workers = config.max_workers
+        logger.info(f"[并发模式] 启用 {workers} 个工作线程")
+
+        with open(output_path, "w", encoding="utf-8") as out_f:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_conv = {}
+
+                for conv_id, raw_records in _iter_csv_as_conversations(config.input_csv):
+                    future = executor.submit(
+                        _process_single_conversation,
+                        conv_id, raw_records,
+                        stage1, stage2, scorer,
+                        bot_engine, voicemail_engine, topo_engine,
+                    )
+                    future_to_conv[future] = (conv_id, len(raw_records))
+
+                for future in as_completed(future_to_conv):
+                    conv_id, raw_len = future_to_conv[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        logger.error(f"[Pipeline] 会话 {conv_id} 抛出异常: {exc}", exc_info=True)
+                        stats["total_conversations"] += 1
+                        stats["total_records"] += raw_len
+                        continue
+                    _update_stats_and_write(out_f, result, conv_id, raw_len)
+
+    # ── 串行模式（原有逻辑，max_workers=0） ──────────────────────
+    else:
+        with open(output_path, "w", encoding="utf-8") as out_f:
+            for conv_id, raw_records in _iter_csv_as_conversations(config.input_csv):
+                try:
+                    result = _process_single_conversation(
+                        conv_id, raw_records,
+                        stage1, stage2, scorer,
+                        bot_engine, voicemail_engine, topo_engine,
+                    )
+                except Exception as exc:
+                    logger.error(f"[Pipeline] 会话 {conv_id} 抛出异常: {exc}", exc_info=True)
+                    stats["total_conversations"] += 1
+                    stats["total_records"] += len(raw_records)
+                    continue
+                _update_stats_and_write(out_f, result, conv_id, len(raw_records))
 
     # ── 漏斗摘要 ──────────────────────────────────────────────
     _print_funnel_summary(stats)
