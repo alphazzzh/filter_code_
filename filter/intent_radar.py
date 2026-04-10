@@ -141,6 +141,10 @@ class BgeHttpClient:
         self._service_url = service_url.rstrip("/")
         self._timeout = timeout
         self._max_retries = max_retries
+        # 使用 Session 复用 TCP 连接（Keep-Alive），避免高并发下
+        # 短连接导致 TIME_WAIT 端口耗尽
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
 
     def encode(
         self,
@@ -182,11 +186,10 @@ class BgeHttpClient:
         last_error: Exception | None = None
         for attempt in range(self._max_retries):
             try:
-                resp = requests.post(
+                resp = self._session.post(
                     f"{self._service_url}/embed",
                     json=payload,
                     timeout=self._timeout,
-                    headers={"Content-Type": "application/json"},
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -210,7 +213,7 @@ class BgeHttpClient:
     def health(self) -> bool:
         """检查 TEI 服务健康状态。"""
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._service_url}/health",
                 timeout=5.0,
             )

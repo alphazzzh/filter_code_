@@ -369,7 +369,7 @@ class SyntaxFeatureExtractor:
                 self._extract_imperative(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.KEYWORD_COOC:
-                self._extract_keyword_cooc(text, parsed, feats)
+                self._extract_keyword_cooc(text, parsed, rule, feats)
 
 
             elif rule.rule_type == SyntaxRuleType.VERB_ENTITY_SPARSITY:
@@ -377,10 +377,10 @@ class SyntaxFeatureExtractor:
 
             # ── V5.1 新增：行为学/心理学特征提取器 ────────────
             elif rule.rule_type == SyntaxRuleType.ISOLATION_REQUEST:
-                self._extract_isolation_request(text, parsed, feats)
+                self._extract_isolation_request(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.MICRO_ACTION_COMMAND:
-                self._extract_micro_action_command(text, parsed, feats)
+                self._extract_micro_action_command(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.CONDITIONAL_THREAT:
                 self._extract_conditional_threat(text, parsed, rule, feats)
@@ -390,19 +390,19 @@ class SyntaxFeatureExtractor:
 
             # ── V5.2 新增：多维行为/心理/交易特征提取器 ─────────
             elif rule.rule_type == SyntaxRuleType.TEMPORAL_URGENCY:
-                self._extract_simple_keywords(text, parsed, feats)
+                self._extract_simple_keywords(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.PRIVACY_INTRUSION:
-                self._extract_simple_keywords(text, parsed, feats)
+                self._extract_simple_keywords(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.EMOTIONAL_MANIPULATION:
-                self._extract_simple_keywords(text, parsed, feats)
+                self._extract_simple_keywords(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.IDENTITY_IMPERSONATION:
-                self._extract_simple_keywords(text, parsed, feats)
+                self._extract_simple_keywords(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.CHANNEL_SHIFTING:
-                self._extract_simple_keywords(text, parsed, feats)
+                self._extract_simple_keywords(text, parsed, rule, feats)
 
             elif rule.rule_type == SyntaxRuleType.FINANCIAL_FLOW:
                 # 复用三元组提取器（LTP 增强 + 正则降级双路径）

@@ -170,6 +170,29 @@ class MatchMode(str, Enum):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 全局评分参数 — 执行引擎的硬编码值收拢到此
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 设计原则：所有结构性/拓扑级评分参数不写死在 stage_three_scorer.py 中，
+# 由配置中枢统一管控，运行时只需修改此处即可生效。
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GLOBAL_SCORING_CONFIG = {
+    # ── 受害者抵抗阶梯降权 ──
+    "enable_resistance_discount": True,     # 全局开关，False 即屏蔽阶梯减分
+    "resistance_tier1_penalty":   -10,      # Tier1 轻度抗拒
+    "resistance_tier2_penalty":   -20,      # Tier2 中度质疑
+    "resistance_tier3_penalty":   -35,      # Tier3 明识破/高频拒绝
+    "resistance_compliance_immunity_rate": 0.20,  # 顺从率阈值（≥此值免疫）
+    "resistance_tier3_rate":      0.25,     # Tier3 抵抗率阈值
+    "resistance_tier2_rate":      0.15,     # Tier2 抵抗率阈值
+    # ── 拓扑结构性惩罚 ──
+    "structural_chitchat_penalty": -20,     # 对称平权聊天且无顺从 → 结构性降权
+    # ── Bot × 意图融合 ──
+    "bot_fusion_penalty":          15,      # 融合惩罚加分
+}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Pydantic 强类型参数契约
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 每种 SyntaxRuleType 对应一个 Pydantic BaseModel，

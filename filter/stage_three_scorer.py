@@ -58,6 +58,7 @@ from config_topics import (
     OOD_FALLBACK_REGISTRY,
     PROFANITY_REGISTRY,
     GLOBAL_REDLINE_REGISTRY,
+    GLOBAL_SCORING_CONFIG,
 )
 from models import BotLabel
 
@@ -469,14 +470,21 @@ class IntelligenceScorer:
         ) -> None:
             """
             V5.2 阶梯式受害者抵抗降权机制。
+            V5.3 阶梯惩罚值收拢至 GLOBAL_SCORING_CONFIG，支持运行时配置。
 
             三级阶梯：
-              Tier 1 (轻度): 抵抗率 > 0 但 < 0.15，仅轻微口头抗拒 → -10
-              Tier 2 (中度): 抵抗率 >= 0.15，明确质疑 → -20
-              Tier 3 (重度): 抵抗率 >= 0.25 或明确识破(dismissal)，诈骗未遂 → -35
+              Tier 1 (轻度): 抵抗率 > 0 但 < tier2_rate，仅轻微口头抗拒
+              Tier 2 (中度): 抵抗率 >= tier2_rate，明确质疑
+              Tier 3 (重度): 抵抗率 >= tier3_rate 或明确识破(dismissal)，诈骗未遂
 
-            免疫条件：顺从率 >= 20% → 抵抗全部无效（受害者仍在被控）
+            免疫条件：顺从率 >= compliance_immunity_rate → 抵抗全部无效（受害者仍在被控）
             """
+            cfg = GLOBAL_SCORING_CONFIG
+
+            # 全局开关短路
+            if not cfg.get("enable_resistance_discount", True):
+                return
+
             if not has_high_risk:
                 return
 
@@ -487,6 +495,13 @@ class IntelligenceScorer:
 
             if not potential_resisters:
                 return
+
+            tier1_penalty = cfg.get("resistance_tier1_penalty", -10)
+            tier2_penalty = cfg.get("resistance_tier2_penalty", -20)
+            tier3_penalty = cfg.get("resistance_tier3_penalty", -35)
+            tier2_rate    = cfg.get("resistance_tier2_rate", 0.15)
+            tier3_rate    = cfg.get("resistance_tier3_rate", 0.25)
+            immunity_rate = cfg.get("resistance_compliance_immunity_rate", 0.20)
 
             for target_sid in potential_resisters:
                 target_turns = [
@@ -510,14 +525,14 @@ class IntelligenceScorer:
                 compliance_rate = compliance_count / len(target_turns)
 
                 # 免疫：只要还在高度顺从，抵抗全部无效
-                if compliance_rate >= 0.20:
+                if compliance_rate >= immunity_rate:
                     continue
 
-                # V5.2 阶梯式抵抗惩罚
-                if "dismissal" in target_intents or resistance_rate >= 0.25:
+                # V5.2 阶梯式抵抗惩罚（V5.3 值从配置读取）
+                if "dismissal" in target_intents or resistance_rate >= tier3_rate:
                     # Tier 3：质变——明确识破或高频拒绝，诈骗未遂
                     ctx.apply(
-                        delta  = -35,
+                        delta  = tier3_penalty,
                         tag    = "fraud_failed_target_resisted",
                         reason = (
                             f"检测到高危风险，但疑似受害者({target_sid})明确识破并脱战"
@@ -526,10 +541,10 @@ class IntelligenceScorer:
                     )
                     ctx.tags.add(_SCAM_ATTEMPT_REJECTED_TAG)
                     return
-                elif resistance_rate >= 0.15:
+                elif resistance_rate >= tier2_rate:
                     # Tier 2：中度——强烈质疑
                     ctx.apply(
-                        delta  = -20,
+                        delta  = tier2_penalty,
                         tag    = "target_strong_resistance",
                         reason = f"疑似受害者({target_sid})表现出中度抵触与质疑（抵抗率={resistance_rate:.2f}）",
                     )
@@ -537,7 +552,7 @@ class IntelligenceScorer:
                 elif resistance_rate > 0.0:
                     # Tier 1：轻度——轻微抗拒（可能只是随口骂一句）
                     ctx.apply(
-                        delta  = -10,
+                        delta  = tier1_penalty,
                         tag    = "target_mild_resistance",
                         reason = f"疑似受害者({target_sid})表现出轻微抗拒（抵抗率={resistance_rate:.2f}）",
                     )
@@ -736,7 +751,7 @@ class IntelligenceScorer:
         if result.track_type == TrackType.SYMMETRIC and ifeats.compliance_rate < 0.10:
             if not driver_sid:  # 如果双方都没能被评为 DRIVER（即双方都是 PEER_A / PEER_B 平权聊天）
                 ctx.apply(
-                    delta  = -20,
+                    delta  = GLOBAL_SCORING_CONFIG.get("structural_chitchat_penalty", -20),
                     tag    = "structural_chitchat_penalty",
                     reason = "对称平权聊天且无业务顺从，物理结构判定为废话，执行结构性降权"
                 )
@@ -762,7 +777,7 @@ class IntelligenceScorer:
         "fraud_jargon":     "ai_scam_bot_fraud_jargon",
     }
 
-    _BOT_FUSION_DELTA: int = 15  # 融合惩罚加分
+    _BOT_FUSION_DELTA: int = GLOBAL_SCORING_CONFIG.get("bot_fusion_penalty", 15)  # 融合惩罚加分
 
     @classmethod
     def _run_bot_intent_fusion(

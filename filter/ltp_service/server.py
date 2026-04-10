@@ -148,12 +148,19 @@ class DynamicBatcher:
         """
         提交一批文本，返回对应的 Future 列表。
         调用方 await 每个 Future 即可获得结果。
+        空文本不入队，直接返回空结果，避免 LTP 0 元素张量报错。
         """
         loop = asyncio.get_running_loop()
         futures: list[asyncio.Future] = []
+        empty_result = SingleResult(seg=[], pos=[], dep=[], ner=[])
+
         for text in texts:
             future = loop.create_future()
-            self._queue.put_nowait(_BatchItem(text, future))
+            if not text:
+                # 空文本直接完成，不入队
+                future.set_result(empty_result)
+            else:
+                self._queue.put_nowait(_BatchItem(text, future))
             futures.append(future)
 
         # 等待所有结果，带超时保护
@@ -192,6 +199,11 @@ class DynamicBatcher:
             # ── 等待第一个请求入队 ──
             try:
                 first = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                # 空文本一律跳过（关闭哨兵或异常输入），避免 LTP 0 元素张量报错
+                if first.text == "":
+                    if not first.future.done():
+                        first.future.set_result(SingleResult(seg=[], pos=[], dep=[], ner=[]))
+                    continue
                 batch.append(first)
             except asyncio.TimeoutError:
                 continue  # 空闲轮转
@@ -204,12 +216,13 @@ class DynamicBatcher:
                     break
                 try:
                     item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
-                    # 跳过关闭哨兵的空文本
-                    if item.text == "" and self._shutdown:
-                        # 把哨兵之前收集的也处理掉
+                    # 空文本一律跳过（关闭哨兵或异常输入），避免 LTP 0 元素张量报错
+                    if item.text == "":
                         if not item.future.done():
                             item.future.set_result(SingleResult(seg=[], pos=[], dep=[], ner=[]))
-                        break
+                        if self._shutdown:
+                            break
+                        continue
                     batch.append(item)
                 except asyncio.TimeoutError:
                     break
@@ -234,23 +247,40 @@ class DynamicBatcher:
         """
         将批次文本统一送入 LTP pipeline，结果分发回各 Future。
         在线程池中执行，避免阻塞事件循环。
+        空文本不入 LTP，直接返回空结果，避免 0 元素张量报错。
         """
-        texts = [item.text for item in batch]
+        empty_result = SingleResult(seg=[], pos=[], dep=[], ner=[])
+        non_empty_indices: list[int] = []
+        non_empty_texts: list[str] = []
+
+        for i, item in enumerate(batch):
+            if item.text:
+                non_empty_indices.append(i)
+                non_empty_texts.append(item.text)
+            else:
+                if not item.future.done():
+                    item.future.set_result(empty_result)
+
+        # 全部为空文本，已全部处理
+        if not non_empty_texts:
+            return
+
         t0 = time.monotonic()
 
         loop = asyncio.get_running_loop()
         raw_results = await loop.run_in_executor(
-            None, self._run_pipeline, texts
+            None, self._run_pipeline, non_empty_texts
         )
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.debug(
             "[Batcher] 推理完成: batch=%d, latency=%.1fms",
-            len(batch), elapsed_ms,
+            len(non_empty_texts), elapsed_ms,
         )
 
-        # 分发结果
-        for item, result in zip(batch, raw_results):
+        # 分发结果：只给非空文本的 item 设置结果
+        for idx_in_batch, result in zip(non_empty_indices, raw_results):
+            item = batch[idx_in_batch]
             if not item.future.done():
                 item.future.set_result(result)
 
