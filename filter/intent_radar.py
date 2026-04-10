@@ -1,4 +1,4 @@
-# intent_radar.py  ── V5.1 配置驱动架构（行为学特征增强）
+# intent_radar.py  ── V5.3 配置驱动架构（TEI 服务化增强）
 # ============================================================
 # 软语义轨道：BGE-M3 多语言向量锚点雷达
 #
@@ -17,10 +17,18 @@
 #   长文本按句号→逗号→滑窗三级切分，Max 聚合相似度
 # ② 新增 reload() 公开方法 + _reload_lock 互斥锁，支持线程安全热更新
 # ③ 新增 dynamic_search() 零样本动态语义检索（RAG 增强）
+#
+# V5.3 变更摘要
+# ─────────────────────────────────────────────────────────────
+# ① BGE-M3 服务化：新增 BgeHttpClient，调用 TEI /embed 端点
+# ② 三级降级链：TEI HTTP → 进程内 BGEM3FlagModel → _FallbackEncoder
+# ③ 参数变更：bge_model_name → bge_service_url + bge_model_name
+# ④ 环境变量：MODEL_BGE_PATH → BGE_SERVICE_URL（默认 http://localhost:8080）
 # ============================================================
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import ClassVar, Optional, Any
 
@@ -35,6 +43,12 @@ try:
 except ImportError:
     _BGEM3_AVAILABLE = False
     BGEM3FlagModel = None  # type: ignore
+
+try:
+    import requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
 
 import logging
 logger = logging.getLogger(__name__)
@@ -101,6 +115,111 @@ def _semantic_chunking(text: str, max_chunk_length: int = 80) -> list[str]:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEI HTTP 客户端（BGE-M3 服务化调用）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class BgeHttpClient:
+    """
+    调用 HuggingFace TEI (Text Embeddings Inference) 的 /embed 端点，
+    获取 BGE-M3 dense 向量。
+
+    接口契约：encode() 返回 {"dense_vecs": np.ndarray}，
+    与 BGEM3FlagModel.encode() 的 dense 输出格式一致。
+
+    TEI /embed 请求格式：
+        POST /embed  {"inputs": [...], "normalize": true, "truncate": true}
+    TEI /embed 响应格式：
+        [[0.01, -0.02, ...], [0.03, 0.04, ...]]  (float[][])
+    """
+
+    def __init__(
+        self,
+        service_url: str = "http://localhost:8080",
+        timeout: float = 30.0,
+        max_retries: int = 3,
+    ) -> None:
+        self._service_url = service_url.rstrip("/")
+        self._timeout = timeout
+        self._max_retries = max_retries
+
+    def encode(
+        self,
+        texts: list[str],
+        batch_size: int = 32,
+        max_length: int = 512,
+        **kwargs,
+    ) -> dict[str, np.ndarray]:
+        """
+        调用 TEI /embed 端点获取 dense 向量。
+
+        分批发送请求，每批最多 batch_size 条文本。
+        返回 {"dense_vecs": np.ndarray}，shape = (len(texts), dim)。
+        """
+        if not texts:
+            return {"dense_vecs": np.array([], dtype=np.float32)}
+
+        all_vecs: list[np.ndarray] = []
+
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
+            vecs = self._encode_batch(batch)
+            all_vecs.append(vecs)
+
+        return {"dense_vecs": np.vstack(all_vecs)} if all_vecs else {
+            "dense_vecs": np.array([], dtype=np.float32)
+        }
+
+    def _encode_batch(self, texts: list[str]) -> np.ndarray:
+        """单批编码，带重试。"""
+        import time
+
+        payload = {
+            "inputs": texts,
+            "normalize": True,
+            "truncate": True,
+        }
+
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries):
+            try:
+                resp = requests.post(
+                    f"{self._service_url}/embed",
+                    json=payload,
+                    timeout=self._timeout,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # TEI 返回 float[][]，直接转为 numpy
+                return np.array(data, dtype=np.float32)
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[BgeHttpClient] /embed 请求失败 "
+                    f"(尝试 {attempt + 1}/{self._max_retries}): {e}"
+                )
+                if attempt < self._max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))  # 指数退避
+
+        raise RuntimeError(
+            f"[BgeHttpClient] /embed 请求在 {self._max_retries} 次重试后仍失败: "
+            f"{last_error}"
+        )
+
+    def health(self) -> bool:
+        """检查 TEI 服务健康状态。"""
+        try:
+            resp = requests.get(
+                f"{self._service_url}/health",
+                timeout=5.0,
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 降级编码器（无 GPU / CI 测试环境）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -143,6 +262,12 @@ class IntentRadar:
     - 新增 reload() + _reload_lock，支持配置热更新
     - 新增 dynamic_search()，零样本动态语义检索
 
+    V5.3 变更
+    ─────────────────────────────────────────────────────────
+    - 编码器三级降级链：TEI HTTP → 进程内 BGEM3FlagModel → _FallbackEncoder
+    - 新增 bge_service_url 参数，优先调用 TEI 服务
+    - 环境变量 BGE_SERVICE_URL 优先于参数
+
     扩展方法
     ─────────────────────────────────────────────────────────
     在 config_topics.TOPIC_REGISTRY 中追加新主题 → 自动生效，
@@ -155,22 +280,56 @@ class IntentRadar:
 
     def __init__(
         self,
-        model_name:  str   = "BAAI/bge-m3",
-        use_fp16:    bool  = True,
-        batch_size:  int   = 32,
-        registry:    dict[str, TopicDefinition] = TOPIC_REGISTRY,
+        model_name:      str   = "BAAI/bge-m3",
+        use_fp16:        bool  = True,
+        batch_size:      int   = 32,
+        registry:        dict[str, TopicDefinition] = TOPIC_REGISTRY,
+        bge_service_url: str | None = None,
     ) -> None:
         self._batch_size = batch_size
         self._registry   = registry  # 保存注册表引用，供 reload() 使用
 
-        # ── 模型加载 ──────────────────────────────────────────
-        if _BGEM3_AVAILABLE and BGEM3FlagModel is not None:
-            self._model       = BGEM3FlagModel(model_name, use_fp16=use_fp16)
+        # ── 环境变量覆盖 ───────────────────────────────────────
+        _bge_service_url = os.getenv("BGE_SERVICE_URL", bge_service_url or "")
+
+        # ── 编码器三级降级链 ──────────────────────────────────
+        # Level 1: TEI HTTP 服务（生产环境首选，模型独立部署）
+        # Level 2: 进程内 BGEM3FlagModel（TEI 不可用时的降级）
+        # Level 3: _FallbackEncoder（无 GPU / CI 测试环境兜底）
+        self._encoder_name: str = "fallback"
+
+        if _bge_service_url and _REQUESTS_AVAILABLE:
+            try:
+                client = BgeHttpClient(service_url=_bge_service_url)
+                if client.health():
+                    self._model = client
+                    self._is_fallback = False
+                    self._encoder_name = "tei_http"
+                    logger.info(f"[IntentRadar] 使用 TEI HTTP 服务: {_bge_service_url}")
+                else:
+                    logger.warning(
+                        f"[IntentRadar] TEI 服务健康检查失败: {_bge_service_url}，"
+                        f"降级到进程内模型"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[IntentRadar] TEI 客户端初始化异常: {e}，"
+                    f"降级到进程内模型"
+                )
+
+        # Level 2: 进程内 BGEM3FlagModel（TEI 不可用 或 未配置时）
+        if self._encoder_name == "fallback" and _BGEM3_AVAILABLE and BGEM3FlagModel is not None:
+            self._model = BGEM3FlagModel(model_name, use_fp16=use_fp16)
             self._is_fallback = False
-        else:
+            self._encoder_name = "in_process"
+            logger.info(f"[IntentRadar] 使用进程内 BGEM3FlagModel: {model_name}")
+
+        # Level 3: _FallbackEncoder（无 GPU / CI 测试环境）
+        if self._encoder_name == "fallback":
             import warnings
             warnings.warn(
-                "[IntentRadar] FlagEmbedding 未安装，使用 N-gram 降级编码器。",
+                "[IntentRadar] TEI 服务不可用且 FlagEmbedding 未安装，"
+                "使用 N-gram 降级编码器。",
                 RuntimeWarning, stacklevel=2,
             )
             self._model       = _FallbackEncoder()
@@ -192,16 +351,18 @@ class IntentRadar:
     @classmethod
     def get_instance(
         cls,
-        model_name: str  = "BAAI/bge-m3",
-        use_fp16:   bool = True,
+        model_name:      str  = "BAAI/bge-m3",
+        use_fp16:        bool = True,
+        bge_service_url: str | None = None,
     ) -> "IntentRadar":
         """双重检查锁定，线程安全单例。"""
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = cls(
-                        model_name = model_name,
-                        use_fp16   = use_fp16,
+                        model_name      = model_name,
+                        use_fp16        = use_fp16,
+                        bge_service_url = bge_service_url,
                     )
         return cls._instance
 

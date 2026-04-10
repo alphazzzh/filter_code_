@@ -24,7 +24,8 @@
 #      CONDITIONAL_THREAT / ACTION_TARGET_TRIPLET
 # ② ScoringRules 新增 confidence_discount 字段（规则后端衰减系数）
 # ③ standalone_score 全面压低，防止单项意图直达危险区
-# ④ 多语言支持：锚点词汇中/英/日/韩/粤五语种覆盖
+# ④ 多语言支持：锚点词汇中文全覆盖，英文部分覆盖（~15 主题），
+#    日/韩仅 inbound_user_request 等少量主题覆盖，粤语锚点待补充
 # ⑤ 新增 PROFANITY_REGISTRY（脏话/攻击性词汇库）
 # ⑥ 新增 GLOBAL_REDLINE_REGISTRY（红线前置熔断正则）
 #

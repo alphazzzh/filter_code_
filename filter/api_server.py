@@ -15,7 +15,7 @@
 # ② Step 2.5 新增拓扑分析 + fastText LID 语种打标
 # ③ 阶段二/三异常降级为 206（原 500），便于 DevOps 监控
 # ④ CUDA OOM 捕获 + torch.cuda.empty_cache() 显存碎片清理
-# ⑤ 依赖注入模型路径（MODEL_BGE_PATH / MODEL_LTP_PATH / MODEL_LID_PATH）
+# ⑤ 依赖注入模型路径（MODEL_BGE_PATH / BGE_SERVICE_URL / LTP_SERVICE_URL / MODEL_LID_PATH）
 # ============================================================
 
 import asyncio
@@ -103,16 +103,18 @@ async def lifespan(app: FastAPI):
     # 过载保护计数器的异步锁（必须在 event loop 内创建）
     state._request_lock = asyncio.Lock()
 
-    # 从环境变量读取模型路径（适配微服务 / Docker 部署）
-    bge_path = os.getenv("MODEL_BGE_PATH", "BAAI/bge-m3")
-    ltp_path = os.getenv("MODEL_LTP_PATH", "LTP/small")
-    logger.info(f"模型路径配置: BGE={bge_path}, LTP={ltp_path}")
+    # 从环境变量读取模型路径（适配微服务部署）
+    bge_path    = os.getenv("MODEL_BGE_PATH", "BAAI/bge-m3")
+    bge_svc_url = os.getenv("BGE_SERVICE_URL", "")
+    ltp_url     = os.getenv("LTP_SERVICE_URL", "http://localhost:8900")
+    logger.info(f"模型路径配置: BGE={bge_path}, BGE-TEI={bge_svc_url or '(未配置)'}, LTP-HTTP={ltp_url}")
 
-    # 实例化所有引擎（加载 BGE 模型、LTP 模型等）
+    # 实例化所有引擎（LTP/BGE 已抽离为独立微服务，主进程不再加载大模型）
     state.stage1 = StageOneFilter()
     state.stage2 = StageTwoPipeline(
-        bge_model_name=bge_path,
-        ltp_model_path=ltp_path,
+        bge_model_name  = bge_path,
+        bge_service_url = bge_svc_url or None,
+        ltp_service_url = ltp_url,
     )
     state.scorer = IntelligenceScorer()
     state.bot_engine = BotConfidenceEngine()

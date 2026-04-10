@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -161,62 +162,35 @@ class _NlpBackend:
 
 
 class _LtpBackend(_NlpBackend):
-    """LTP 4.x 后端，标签：HED/SBV/ADV/VOB。"""
+    """LTP 4.x HTTP 微服务后端，标签：HED/SBV/ADV/VOB。
 
-    def __init__(self, model_path: str = "/home/zzh/923/model/ltp_small") -> None:
-        from ltp import LTP  # type: ignore
-        import os
-        if not os.path.isdir(model_path):
-            raise FileNotFoundError(f"[LTP] 本地模型文件夹不存在: {model_path}")
-        self._ltp = LTP(model_path)
+    通过 HTTP 调用独立的 LTP 微服务（Dynamic Batching + 横向扩容），
+    替代进程内 LTP 实例，避免内存/显存峰值拖慢主事件循环。
+
+    环境变量：
+      LTP_SERVICE_URL  微服务地址（默认 http://localhost:8900）
+    降级策略：
+      微服务不可用时，自动降级到 HanLP → 规则后端。
+    """
+
+    def __init__(self, service_url: str | None = None) -> None:
+        from ltp_service.client import LtpHttpClient
+        url = service_url or os.getenv("LTP_SERVICE_URL", "http://localhost:8900")
+        self._client = LtpHttpClient(base_url=url)
+        # 启动时做健康检查，确认微服务可用
+        health = self._client.health()
+        if health.get("status") != "ok" or not health.get("model_loaded", False):
+            raise ConnectionError(
+                f"[LTP] 微服务不可用 (url={url}, health={health})"
+            )
 
     @property
     def name(self) -> str:
         return "ltp"
 
     def analyze(self, text: str) -> dict[str, Any]:
-        output = self._ltp.pipeline([text], tasks=["cws", "dep", "ner"])
-        tokens: list[str] = output.cws[0] if output.cws else []
-        
-        # ==========================================================
-        # 1. 鲁棒兼容处理依存句法 (dep)
-        # ==========================================================
-        dep: list[tuple[int, str]] = []
-        if output.dep:
-            dep_data = output.dep[0]
-            if isinstance(dep_data, dict):
-                # 新版 LTP 格式: {'head': [2, 0], 'label': ['SBV', 'HED']}
-                heads = dep_data.get("head", [])
-                labels = dep_data.get("label", [])
-                for h, l in zip(heads, labels):
-                    dep.append((h - 1, l.upper()))
-            elif isinstance(dep_data, list):
-                # 旧版 LTP 格式: [{'head': 2, 'label': 'SBV'}, ...]
-                for d in dep_data:
-                    if isinstance(d, dict):
-                        dep.append((d.get("head", 1) - 1, d.get("label", "UNK").upper()))
-        
-        # ==========================================================
-        # 2. 鲁棒兼容处理命名实体识别 (ner) 
-        # ==========================================================
-        ner: list[tuple[str, str]] = []
-        if output.ner:
-            ner_data = output.ner[0]
-            if isinstance(ner_data, dict):
-                # 新版 LTP 格式: {'label': ['Nh'], 'text': ['张三'], 'offset': [...]}
-                labels = ner_data.get("label", [])
-                texts = ner_data.get("text", [])
-                for t, l in zip(texts, labels):
-                    ner.append((t, l))
-            elif isinstance(ner_data, list):
-                # 旧版 LTP 格式: [{'label': 'Nh', 'text': '张三'}, ...]
-                for d in ner_data:
-                    if isinstance(d, dict):
-                        t = d.get("text", d.get("name", ""))
-                        l = d.get("label", d.get("tag", ""))
-                        ner.append((t, l))
-                        
-        return {"tokens": tokens, "dep": dep, "ner": ner}
+        """调用微服务 /analyze 接口，返回与旧版 _LtpBackend.analyze 兼容格式。"""
+        return self._client.analyze(text)
 
 
 class _HanLpBackend(_NlpBackend):
@@ -266,13 +240,18 @@ class _RuleBasedFallback(_NlpBackend):
         return {"tokens": list(text), "dep": [], "ner": ner}
 
 
-def _load_nlp_backend(ltp_model_path: str = "LTP/small") -> _NlpBackend:
-    """按 LTP → HanLP → 规则 顺序自动降级，ltp_model_path 透传到 LTP 后端。"""
-    for BackendCls, label in [(_LtpBackend, "LTP"), (_HanLpBackend, "HanLP")]:
+def _load_nlp_backend(ltp_service_url: str | None = None) -> _NlpBackend:
+    """按 LTP 微服务 → HanLP → 规则 顺序自动降级。
+
+    ltp_service_url: LTP 微服务地址（默认从 LTP_SERVICE_URL 环境变量读取）。
+    微服务不可用时自动降级到 HanLP，最终兜底规则后端。
+    """
+    for BackendCls, label, kwargs in [
+        (_LtpBackend, "LTP-HTTP", {"service_url": ltp_service_url}),
+        (_HanLpBackend, "HanLP", {}),
+    ]:
         try:
-            if BackendCls is _LtpBackend:
-                return _LtpBackend(model_path=ltp_model_path)
-            return BackendCls()
+            return BackendCls(**kwargs)
         except Exception as e:
             warnings.warn(f"[NLP] {label} 加载失败（{e}），尝试下一个。", RuntimeWarning)
     return _RuleBasedFallback()
@@ -975,24 +954,26 @@ class StageTwoPipeline:
         bge_model_name:   str   = "BAAI/bge-m3",
         use_fp16:         bool  = True,
         intent_threshold: float = 0.72,
-        ltp_model_path:   str   = "LTP/small",
+        ltp_service_url:  str   | None = None,
+        bge_service_url:  str   | None = None,
         nlp_backend:      Optional[_NlpBackend] = None,
     ) -> None:
         self._topology = TopologyAnalyzer()
         self._radar    = IntentRadar.get_instance(
-            model_name = bge_model_name,
-            use_fp16   = use_fp16,
+            model_name      = bge_model_name,
+            use_fp16        = use_fp16,
+            bge_service_url = bge_service_url,
         )
         self._binder = RoleBinder(
             radar    = self._radar,
             topology = self._topology,
         )
-        # 若未传入外部 nlp_backend，则使用 _load_nlp_backend 并透传 ltp_model_path
+        # 若未传入外部 nlp_backend，则使用 _load_nlp_backend 并透传 ltp_service_url
         if nlp_backend is not None:
             self._syntax = SyntaxFeatureExtractor(backend=nlp_backend)
         else:
             self._syntax = SyntaxFeatureExtractor(
-                backend=_load_nlp_backend(ltp_model_path=ltp_model_path)
+                backend=_load_nlp_backend(ltp_service_url=ltp_service_url)
             )
 
     def process_conversation(

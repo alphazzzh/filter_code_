@@ -45,20 +45,26 @@ class FilterNode:
     def __init__(
         self, 
         bge_model_name: str = "BAAI/bge-m3", 
-        ltp_model_path: str = "LTP/small",
+        ltp_service_url: str | None = None,
+        bge_service_url: str | None = None,
         log_dir: str = "logs"
     ):
         logger.info("[Filter Node] 正在加载...")
         
         # 👇 最佳实践：环境变量优先，参数其次，默认值兜底
-        actual_bge_path = os.getenv("MODEL_BGE_PATH", bge_model_name)
-        actual_ltp_path = os.getenv("MODEL_LTP_PATH", ltp_model_path)
+        actual_bge_path    = os.getenv("MODEL_BGE_PATH", bge_model_name)
+        actual_bge_svc_url = os.getenv("BGE_SERVICE_URL", bge_service_url or "")
+        actual_ltp_url     = os.getenv("LTP_SERVICE_URL", ltp_service_url or "http://localhost:8900")
         self.log_dir = os.getenv("RISK_LOG_DIR", log_dir)
         
-        logger.info(f"模型路径配置: BGE={actual_bge_path}, LTP={actual_ltp_path}")
+        logger.info(f"模型路径配置: BGE={actual_bge_path}, BGE-TEI={actual_bge_svc_url or '(未配置)'}, LTP-HTTP={actual_ltp_url}")
 
         self.stage1 = StageOneFilter()
-        self.stage2 = StageTwoPipeline(bge_model_name=actual_bge_path, ltp_model_path=actual_ltp_path)
+        self.stage2 = StageTwoPipeline(
+            bge_model_name  = actual_bge_path,
+            bge_service_url = actual_bge_svc_url or None,
+            ltp_service_url = actual_ltp_url,
+        )
         self.scorer = IntelligenceScorer()
         self.voicemail_engine = AdvancedVoicemailDetector()
         self.topo_engine = TopologyEngine()

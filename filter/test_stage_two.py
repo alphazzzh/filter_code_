@@ -59,10 +59,10 @@ def _make_turn(
 
 @pytest.fixture(scope="module")
 def radar() -> IntentRadar:
-    """使用降级编码器的 IntentRadar 实例（无需 GPU）。"""
+    """使用降级编码器的 IntentRadar 实例（无需 GPU / TEI）。"""
     # 重置单例，防止测试间状态污染
     IntentRadar._instance = None
-    return IntentRadar(model_name="BAAI/bge-m3", use_fp16=False)
+    return IntentRadar(model_name="BAAI/bge-m3", use_fp16=False, bge_service_url=None)
 
 
 @pytest.fixture(scope="module")
@@ -380,7 +380,7 @@ class TestStageTwoPipeline:
     @pytest.fixture(scope="class")
     def pipeline(self) -> StageTwoPipeline:
         IntentRadar._instance = None
-        return StageTwoPipeline(bge_model_name="BAAI/bge-m3", use_fp16=False)
+        return StageTwoPipeline(bge_model_name="BAAI/bge-m3", use_fp16=False, bge_service_url=None)
 
     def _make_asymmetric_records(self) -> list[ASRRecord]:
         """模拟非对称通话记录：A 大量输出，B 纯附和。"""

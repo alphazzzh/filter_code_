@@ -5,7 +5,7 @@
 # 流水线架构
 # ─────────────────────────────────────────────────────────────
 #             ┌─────────────┐
-#   CSV/API → │ StageOneFilter│ → (过滤低价值)
+#   CSV/API ─→│ StageOneFilter│ → (过滤低价值)
 #             └──────┬───────┘
 #                    │ 接通 or 灰区记录
 #                    ▼
@@ -84,6 +84,7 @@ class PipelineConfig:
     fasttext_model:  str = "models/lid.176.bin"
     # 阶段二
     bge_model_name:  str = "BAAI/bge-m3"
+    bge_service_url: str = ""          # V5.3: TEI 服务地址（空=进程内降级）
     use_fp16:        bool = True
     intent_threshold:float = 0.75
     # 漏斗路由：纯噪音记录直接丢弃
@@ -122,76 +123,93 @@ def _route_record(records: list[ASRRecord]) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CSV 读取 & ASRRecord 组装
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-'''
-def _iter_csv_as_conversations(
-    csv_path: str,
-) -> Iterator[tuple[str, list[ASRRecord]]]:
+# CSV 格式约定（V5.0+）：
+#   第一列：序号（无用，读取时跳过）
+#   第二列：整通对话的超长文本（由 parse_transcript_cell 拆解为 ASRRecord）
+#   表头：可选，_is_header_like() 自动检测，无表头时不跳过第一行
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── 表头检测阈值 ──────────────────────────────────────────────
+# 多语言适配说明：
+#   CJK 表头名通常 ≤8 字（如"对话内容""通話内容""대화 내용"），
+#   英文表头名通常 ≤3 词（如"Transcript""Conversation"），
+#   而实际对话数据动辄数百字。阈值 50 字符可安全区分两者。
+#   极端情况（英文长表头名）由 _is_header_like 兜底。
+_HEADER_DATA_THRESHOLD: int = 50
+
+# 多语言常见 CSV 表头关键词（中/英/日/粤/韩）
+# 如果第一行第二列命中这些词，则明确判定为表头
+_HEADER_KEYWORDS: frozenset[str] = frozenset({
+    # ── 中文表头 ──
+    "对话", "对话内容", "通话内容", "文本", "内容", "转录", "转写文本",
+    "原始文本", "通话记录", "录音文本",
+    # ── 英文表头 ──
+    "transcript", "conversation", "text", "content", "dialogue",
+    "record", "speech", "utterance",
+    # ── 日文表头 ──
+    "対話", "通話内容", "テキスト", "書き起こし", "会話",
+    # ── 粤语表头 ──
+    "對話", "通話內容", "內容", "錄音文本",
+    # ── 韩文表头 ──
+    "대화", "통화내용", "텍스트", "내용", "전사",
+})
+
+
+def _is_header_like(text: str) -> bool:
     """
-    从 CSV 文件中按 conversation_id 分组，逐组 yield (conv_id, records)。
-
-    期望 CSV 列名（最小集）
-    ──────────────────────────────────────────────────────────
-    conversation_id : 会话标识（同一通话的多行共享此 ID）
-    record_id       : 单条 ASR 片段唯一 ID
-    speaker_id      : 发言方 ID（如 "A"/"B" 或 "wxid_xxx"）
-    raw_text        : ASR 原始转写文本
-
-    可选列（有则读取，无则留空）
-    ──────────────────────────────────────────────────────────
-    cleaned_text    : 阶段一已处理的容错文本
-    source_lang_hint: 上游语种提示
+    判断第二列文本是否像表头名而非数据行。
+    
+    检测策略（三重判定，任一命中即判为表头）：
+      1. 关键词命中：文本与 _HEADER_KEYWORDS 精确匹配（大小写不敏感）
+      2. 长度判定：文本长度 ≤ _HEADER_DATA_THRESHOLD，疑似表头
+      3. 空值兜底：空字符串视为表头占位符
+    
+    多语言说明：
+      - CJK 字符占 1 位长度，中文表头"对话内容"=4 字符
+      - 英文长表头"Conversation Transcript"=24 字符
+      - 均远小于阈值 50，而实际对话数据通常 >100 字符
     """
-    current_conv_id: str | None = None
-    current_records: list[ASRRecord] = []
+    stripped = text.strip().lower()
+    # 策略1：精确匹配多语言表头关键词
+    if stripped in _HEADER_KEYWORDS:
+        return True
+    # 策略2：空值兜底
+    if not stripped:
+        return True
+    # 策略3：长度判定——短文本疑似表头
+    if len(stripped) <= _HEADER_DATA_THRESHOLD:
+        return True
+    return False
 
-    path = Path(csv_path)
-    if not path.exists():
-        logger.warning(f"CSV 文件不存在：{csv_path}，将使用内置 Mock 数据。")
-        yield from _iter_mock_conversations()
-        return
 
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            conv_id:   str = row.get("conversation_id", "unknown")
-            record_id: str = row.get("record_id", f"r_{id(row)}")
-            speaker_id:str = row.get("speaker_id", "A")
-            raw_text:  str = row.get("raw_text", "").strip()
-
-            if not raw_text:
-                continue  # 跳过空行
-
-            record = ASRRecord(
-                record_id        = record_id,
-                speaker_id       = speaker_id,
-                raw_text         = raw_text,
-                cleaned_text     = row.get("cleaned_text") or None,
-                source_lang_hint = row.get("source_lang_hint") or None,
-            )
-
-            if conv_id != current_conv_id:
-                if current_records and current_conv_id:
-                    yield current_conv_id, current_records
-                current_conv_id  = conv_id
-                current_records  = [record]
-            else:
-                current_records.append(record)
-
-        # 最后一组
-        if current_records and current_conv_id:
-            yield current_conv_id, current_records
-
-'''
 def _iter_csv_as_conversations(csv_file_path: str):
     """
     读取 CSV 文件并使用生成器逐条产出会话记录。
     要求：CSV 第一列无用，第二列是包含整通对话的超长文本。
+    
+    自动检测表头（多语言适配）：
+      - 读取第一行后，通过 _is_header_like() 三重策略判断是否为表头
+      - 有表头 → 正常跳过第一行
+      - 无表头 → 第一行作为数据行纳入处理，避免丢失数据
     """
     with open(csv_file_path, mode='r', encoding='utf-8-sig') as f:
         reader = csv.reader(f)
-        header = next(reader, None)  # 跳过表头
+        first_row = next(reader, None)  # 先读取第一行
+        
+        # ── 自动表头检测（多语言三重策略） ──
+        # 如果第二列内容不像表头名（即 _is_header_like 返回 False），
+        # 说明第一行就是数据行，不应跳过
+        has_header = True
+        if first_row and len(first_row) >= 2:
+            if not _is_header_like(first_row[1]):
+                has_header = False
+        
+        # 组装完整行列表：无表头时将第一行重新纳入
+        rows = []
+        if not has_header and first_row:
+            rows.append(first_row)
+        rows.extend(reader)
 
-        for idx, row in enumerate(reader):
+        for idx, row in enumerate(rows):
             # 确保至少有两列
             if len(row) < 2:
                 continue
@@ -307,11 +325,12 @@ def run_pipeline(config: PipelineConfig) -> None:
         fasttext_model_path = config.fasttext_model,
     )
 
-    logger.info("[初始化] 加载 StageTwoPipeline（BGE-M3）…")
+    logger.info("[初始化] 加载 StageTwoPipeline（BGE-M3 / TEI）…")
     stage2 = StageTwoPipeline(
         bge_model_name   = config.bge_model_name,
         use_fp16         = config.use_fp16,
         intent_threshold = config.intent_threshold,
+        bge_service_url  = config.bge_service_url or None,
     )
 
     logger.info("[初始化] 加载 IntelligenceScorer（规则引擎）…")
