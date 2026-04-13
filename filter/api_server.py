@@ -284,7 +284,8 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response, debug: b
             state.stage2.process_conversation,
             conversation_id=req.session_id,
             records=valid_records,
-            extra_metadata=extra_meta
+            extra_metadata=extra_meta,
+            pre_merged_turns=turns,  # 透传已合并的 turns，避免 CPU 重复 merge_turns
         )
 
         try:

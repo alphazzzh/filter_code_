@@ -527,73 +527,116 @@ class IntentRadar:
         top_k: int = 10
     ) -> dict[str, Any]:
         """
-        零样本动态语义检索（RAG 增强版）
+        零样本动态语义检索（RAG 增强版）—— 单主题便捷接口。
+        内部委托给 dynamic_search_batch，向后兼容旧调用方。
         """
-        clean_topic = dynamic_topic.strip() if dynamic_topic else ""
-        if not search_chunks or not clean_topic:
+        batch_result = self.dynamic_search_batch(
+            search_chunks=search_chunks,
+            dynamic_topics=[dynamic_topic],
+            default_threshold=default_threshold,
+            top_k=top_k,
+        )
+        # dynamic_search_batch 返回最佳主题结果，直接透传
+        return batch_result
+
+    def dynamic_search_batch(
+        self, 
+        search_chunks: list[str], 
+        dynamic_topics: list[str],
+        default_threshold: float = 0.65,
+        top_k: int = 10,
+    ) -> dict[str, Any]:
+        """
+        零样本动态语义检索（多主题批量版，RAG 增强版）
+
+        核心优化：search_chunks 只编码 1 次，所有主题共享同一份文档向量。
+        原先 N 个主题 = N 次 GPU 推理 → 现在 1 + 1 次（文档 1 次 + 主题 1 次）。
+
+        返回得分最高的那个主题的结果（内部竞价）。
+
+        Parameters
+        ----------
+        search_chunks    : 滑动窗口切块后的对话文本列表
+        dynamic_topics   : 待检索的主题指令列表
+        default_threshold: 语义匹配阈值
+        top_k            : 每主题最多返回的匹配数
+
+        Returns
+        -------
+        dict[str, Any]  得分最高主题的检索结果（与旧 dynamic_search 格式一致）
+        """
+        # 清洗主题列表
+        clean_topics = [t.strip() for t in dynamic_topics if t and t.strip()]
+        if not search_chunks or not clean_topics:
             return {
-                "topic_queried": clean_topic,
-                "matched": False, 
+                "topic_queried": str(clean_topics) if clean_topics else "",
+                "matched": False,
                 "max_score": 0.0,
                 "top_matches": [],
                 "status": "skipped_due_to_empty_input"
             }
 
         try:
-            # 1. 构造检索向量
-            query_instruction = f"为这个句子生成表示以用于检索相关文章：{clean_topic}"
-            query_vec = self._model.encode([query_instruction])["dense_vecs"][0]
-            
-            # 2. 对所有滑动窗口块进行向量化
+            # ── 1. 文档块只编码 1 次！（核心省算力点）────────────
             encoded_docs = self._model.encode(search_chunks)
-            
-            # 增加字典解析：兼容 BGE-M3 的字典输出和传统模型的数组输出
             if isinstance(encoded_docs, dict) and 'dense_vecs' in encoded_docs:
                 doc_vecs = encoded_docs['dense_vecs']
             else:
                 doc_vecs = encoded_docs
-                
-            if doc_vecs.ndim == 1:   # ✅ 现在 doc_vecs 是纯粹的 Numpy 数组了
+
+            if doc_vecs.ndim == 1:
                 doc_vecs = doc_vecs.reshape(1, -1)
-                
-            # 3. 计算余弦相似度矩阵
-            similarities = np.dot(doc_vecs, query_vec)
 
-            # =========================================================
-            # 【RAG 优化方向三：召回阈值以上的 Top-K 完整对话】
-            # =========================================================
-            # 找出所有大于等于安全阈值的索引
-            valid_indices = np.where(similarities >= default_threshold)[0]
-            
-            top_matches = []
-            if len(valid_indices) > 0:
-                # 按相似度从高到低排序
-                sorted_valid_indices = valid_indices[np.argsort(similarities[valid_indices])[::-1]]
-                # 截取前 K 个
-                top_indices = sorted_valid_indices[:top_k]
-                
-                # 组装返回结果，直接返回带说话人的完整上下文
-                for idx in top_indices:
-                    top_matches.append({
-                        "score": round(float(similarities[idx]), 4),
-                        "chunk_text": search_chunks[idx]  # 直接返回完整的原汁原味的对话块
-                    })
+            # ── 2. 批量编码所有主题指令 ──────────────────────────
+            query_instructions = [
+                f"为这个句子生成表示以用于检索相关文章：{t}"
+                for t in clean_topics
+            ]
+            query_vecs = self._model.encode(query_instructions)["dense_vecs"]
 
-            # 计算全局最高分
-            max_score = float(np.max(similarities)) if len(similarities) > 0 else 0.0
+            # ── 3. 矩阵乘法：(N个文本块, Dim) × (Dim, M个Topic) = (N, M) ──
+            similarity_matrix = np.dot(doc_vecs, query_vecs.T)  # shape: (N, M)
 
-            return {
-                "topic_queried": clean_topic,
-                "matched": len(top_matches) > 0,
-                "max_score": round(max_score, 4),
-                "top_matches": top_matches,
-                "status": "success"
-            }
+            # ── 4. 逐主题提取最佳匹配，内部竞价 ──────────────────
+            best_result: dict[str, Any] | None = None
+
+            for col_idx, topic in enumerate(clean_topics):
+                similarities = similarity_matrix[:, col_idx]  # (N,)
+
+                # 阈值筛选 + Top-K 召回
+                valid_indices = np.where(similarities >= default_threshold)[0]
+                top_matches = []
+                if len(valid_indices) > 0:
+                    sorted_indices = valid_indices[np.argsort(similarities[valid_indices])[::-1]]
+                    for idx in sorted_indices[:top_k]:
+                        top_matches.append({
+                            "score": round(float(similarities[idx]), 4),
+                            "chunk_text": search_chunks[idx]
+                        })
+
+                max_score = float(np.max(similarities)) if len(similarities) > 0 else 0.0
+
+                topic_result = {
+                    "topic_queried": topic,
+                    "matched": len(top_matches) > 0,
+                    "max_score": round(max_score, 4),
+                    "top_matches": top_matches,
+                    "status": "success"
+                }
+
+                # 内部竞价：保留得分最高的主题
+                if best_result is None or max_score > best_result.get("max_score", 0.0):
+                    best_result = topic_result
+
+            return best_result  # type: ignore[return-value]
 
         except Exception as e:
-            logger.error(f"[DynamicSearch] 检索主题 '{clean_topic}' 时发生异常: {str(e)}", exc_info=True)
+            logger.error(
+                f"[DynamicSearchBatch] 批量检索异常 (topics={clean_topics}): {str(e)}",
+                exc_info=True,
+            )
             return {
-                "topic_queried": clean_topic,
+                "topic_queried": str(clean_topics),
                 "matched": False,
                 "max_score": 0.0,
                 "top_matches": [],

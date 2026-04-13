@@ -147,7 +147,8 @@ class FilterNode:
                 self.stage2.process_conversation,
                 conversation_id=session_id,
                 records=s1_records,
-                extra_metadata=extra_meta
+                extra_metadata=extra_meta,
+                pre_merged_turns=turns,  # 透传已合并的 turns，避免 CPU 重复 merge_turns
             )
             
             async with self.gpu_semaphore:

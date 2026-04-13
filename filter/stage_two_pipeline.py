@@ -41,7 +41,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from models_stage2 import ASRRecord, StageTwoResult, TrackType
+from models_stage2 import ASRRecord, StageTwoResult, TrackType, DialogueTurn
 from topology_engine import TopologyAnalyzer
 from intent_radar import IntentRadar
 from role_binder import RoleBinder
@@ -1049,15 +1049,25 @@ class StageTwoPipeline:
         conversation_id: str,
         records:         list[ASRRecord],
         extra_metadata:  dict[str, Any] | None = None,
+        pre_merged_turns: list[DialogueTurn] | None = None,
     ) -> StageTwoResult:
         """
         处理一段完整对话，输出双轨融合的 StageTwoResult。
         metadata["nlp_features"] 中存放 NlpFeatures.to_dict() 的产出。
+
+        Parameters
+        ----------
+        pre_merged_turns : 若上游（filter_node / api_server）已合并过 turns，
+                           直接透传以避免重复 merge_turns 开销（CPU 冗余消除）。
         """
         from typing import Any as _Any  # 避免顶层循环引用
 
         # ── 软语义轨道 ────────────────────────────────────────
-        merged_turns  = self._topology.merge_turns(records)
+        # 优先使用上游预合并的 turns，避免 CPU 重复 merge_turns
+        if pre_merged_turns is not None:
+            merged_turns = pre_merged_turns
+        else:
+            merged_turns = self._topology.merge_turns(records)
         track_type    = self._topology.classify_track(merged_turns)
         labeled_turns, role_results, ifeats = self._binder.bind(
             turns=merged_turns, track_type=track_type
@@ -1123,23 +1133,14 @@ class StageTwoPipeline:
                     chunk_text = " ".join([f"[{t.speaker_id}] {t.merged_text.strip()}" for t in window])
                     search_chunks.append(chunk_text)
 
-                # 🚀 核心升级：多主题独立搜索，拒绝语义稀释！
-                best_result = None
-                for single_topic in topics_to_search:
-                    # 每个主题拥有独立的纯净向量，互不干扰
-                    res = self._radar.dynamic_search(
-                        search_chunks=search_chunks, 
-                        dynamic_topic=single_topic,
-                        default_threshold=0.40,
-                        top_k=1  
-                    )
-                    
-                    # 内部竞价：保留得分最高的那个主题的情报
-                    current_score = res.get("max_score", 0.0)
-                    if not best_result or current_score > best_result.get("max_score", 0.0):
-                        best_result = res
-                
-                dynamic_search_result = best_result
+                # 🚀 核心升级：多主题批量检索，文档块只编码 1 次！
+                # 原先 N 个主题 = N 次 GPU 推理 → 现在 1+1 次（文档 1 次 + 主题 1 次）
+                dynamic_search_result = self._radar.dynamic_search_batch(
+                    search_chunks=search_chunks,
+                    dynamic_topics=topics_to_search,
+                    default_threshold=0.40,
+                    top_k=1,
+                )
             else:
                 dynamic_search_result = {
                     "topic_queried": str(topics_to_search),
