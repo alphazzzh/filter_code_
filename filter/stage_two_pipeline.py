@@ -164,6 +164,16 @@ class _NlpBackend:
         """批量分析，默认逐条调用 analyze()，子类可覆盖以提升吞吐。"""
         return [self.analyze(t) for t in texts]
 
+    # ── V5.5 异步方法（默认委托给同步实现，子类可覆盖）─────────
+
+    async def analyze_async(self, text: str) -> dict[str, Any]:
+        """异步单条分析，默认委托给同步方法。"""
+        return self.analyze(text)
+
+    async def analyze_batch_async(self, texts: list[str]) -> list[dict[str, Any]]:
+        """异步批量分析，默认委托给同步方法。"""
+        return self.analyze_batch(texts)
+
 
 class _LtpBackend(_NlpBackend):
     """LTP 4.x HTTP 微服务后端，标签：HED/SBV/ADV/VOB。
@@ -174,7 +184,8 @@ class _LtpBackend(_NlpBackend):
     环境变量：
       LTP_SERVICE_URL  微服务地址（默认 http://localhost:8900）
     降级策略：
-      微服务不可用时，自动降级到 HanLP → 规则后端。
+      微服务不可用时，自动降级到规则后端（_RuleBasedFallback），
+      不阻断打分流水线。
     """
 
     def __init__(self, service_url: str | None = None) -> None:
@@ -187,18 +198,60 @@ class _LtpBackend(_NlpBackend):
             raise ConnectionError(
                 f"[LTP] 微服务不可用 (url={url}, health={health})"
             )
+        # 延迟初始化降级后端（仅在运行时降级时才创建，避免浪费资源）
+        self._fallback: _RuleBasedFallback | None = None
 
     @property
     def name(self) -> str:
         return "ltp"
 
+    def _get_fallback(self) -> _RuleBasedFallback:
+        """懒加载规则降级后端"""
+        if self._fallback is None:
+            self._fallback = _RuleBasedFallback()
+        return self._fallback
+
     def analyze(self, text: str) -> dict[str, Any]:
-        """调用微服务 /analyze 接口，返回与旧版 _LtpBackend.analyze 兼容格式。"""
-        return self._client.analyze(text)
+        """调用微服务 /analyze 接口，失败时降级到规则后端。"""
+        try:
+            return self._client.analyze(text)
+        except Exception as e:
+            logger.warning(
+                f"[LtpBackend] analyze HTTP 失败，降级到 rule_based: {e}"
+            )
+            return self._get_fallback().analyze(text)
 
     def analyze_batch(self, texts: list[str]) -> list[dict[str, Any]]:
-        """调用微服务批量接口，1 次 HTTP 请求替代 N 次。"""
-        return self._client.analyze_batch(texts)
+        """调用微服务批量接口，失败时降级到规则后端（逐条）。"""
+        try:
+            return self._client.analyze_batch(texts)
+        except Exception as e:
+            logger.warning(
+                f"[LtpBackend] analyze_batch HTTP 失败，降级到 rule_based: {e}"
+            )
+            return [self._get_fallback().analyze(t) for t in texts]
+
+    # ── V5.5 异步方法 ──────────────────────────────────────
+
+    async def analyze_async(self, text: str) -> dict[str, Any]:
+        """异步调用微服务，失败时降级到规则后端。"""
+        try:
+            return await self._client.analyze_async(text)
+        except Exception as e:
+            logger.warning(
+                f"[LtpBackend] analyze_async HTTP 失败，降级到 rule_based: {e}"
+            )
+            return self._get_fallback().analyze(text)
+
+    async def analyze_batch_async(self, texts: list[str]) -> list[dict[str, Any]]:
+        """异步批量调用微服务，失败时降级到规则后端。"""
+        try:
+            return await self._client.analyze_batch_async(texts)
+        except Exception as e:
+            logger.warning(
+                f"[LtpBackend] analyze_batch_async HTTP 失败，降级到 rule_based: {e}"
+            )
+            return [self._get_fallback().analyze(t) for t in texts]
 
 
 class _HanLpBackend(_NlpBackend):
@@ -425,6 +478,57 @@ class SyntaxFeatureExtractor:
             self._apply_rules(text, parsed, feats)
             results.append(feats)
 
+        return results
+
+    # ── V5.5 异步方法 ──────────────────────────────────────
+
+    async def extract_async(self, text: str) -> NlpFeatures:
+        """异步单条提取。"""
+        feats = NlpFeatures(nlp_backend=self._backend.name)
+
+        needs_nlp = any(
+            r.rule_type in (
+                SyntaxRuleType.NER_DENSITY,
+                SyntaxRuleType.IMPERATIVE_SYNTAX,
+                SyntaxRuleType.VERB_ENTITY_SPARSITY,
+                SyntaxRuleType.CONDITIONAL_THREAT,
+                SyntaxRuleType.ACTION_TARGET_TRIPLET,
+                SyntaxRuleType.FINANCIAL_FLOW,
+            )
+            for r in self._rules.values()
+        ) or self._needs_nlp_for_match_mode()
+
+        parsed: dict[str, Any] = await self._backend.analyze_async(text) if needs_nlp else {}
+        self._apply_rules(text, parsed, feats)
+        return feats
+
+    async def extract_batch_async(self, texts: list[str]) -> list[NlpFeatures]:
+        """异步批量提取特征。"""
+        needs_nlp = any(
+            r.rule_type in (
+                SyntaxRuleType.NER_DENSITY,
+                SyntaxRuleType.IMPERATIVE_SYNTAX,
+                SyntaxRuleType.VERB_ENTITY_SPARSITY,
+                SyntaxRuleType.CONDITIONAL_THREAT,
+                SyntaxRuleType.ACTION_TARGET_TRIPLET,
+                SyntaxRuleType.FINANCIAL_FLOW,
+            )
+            for r in self._rules.values()
+        ) or self._needs_nlp_for_match_mode()
+
+        if needs_nlp:
+            parsed_batch = await self._backend.analyze_batch_async(texts)
+        else:
+            parsed_batch = [{}] * len(texts)
+
+        results: list[NlpFeatures] = []
+        for text, parsed in zip(texts, parsed_batch):
+            if not text.strip():
+                results.append(NlpFeatures(nlp_backend=self._backend.name))
+                continue
+            feats = NlpFeatures(nlp_backend=self._backend.name)
+            self._apply_rules(text, parsed, feats)
+            results.append(feats)
         return results
 
     def _apply_rules(self, text: str, parsed: dict[str, Any], feats: NlpFeatures) -> None:
@@ -1025,13 +1129,23 @@ class StageTwoPipeline:
         ltp_service_url:  str   | None = None,
         bge_service_url:  str   | None = None,
         nlp_backend:      Optional[_NlpBackend] = None,
+        *,
+        _async: bool = False,
     ) -> None:
+        self._is_async = _async
         self._topology = TopologyAnalyzer()
-        self._radar    = IntentRadar.get_instance(
-            model_name      = bge_model_name,
-            use_fp16        = use_fp16,
-            bge_service_url = bge_service_url,
-        )
+        if _async:
+            self._radar = IntentRadar.get_async_instance(
+                model_name      = bge_model_name,
+                use_fp16        = use_fp16,
+                bge_service_url = bge_service_url,
+            )
+        else:
+            self._radar = IntentRadar.get_instance(
+                model_name      = bge_model_name,
+                use_fp16        = use_fp16,
+                bge_service_url = bge_service_url,
+            )
         self._binder = RoleBinder(
             radar    = self._radar,
             topology = self._topology,
@@ -1165,6 +1279,130 @@ class StageTwoPipeline:
             
         if extra_metadata:
             # 剔除传入的 dynamic_topic，避免返回结果里冗余
+            clean_extra = {k: v for k, v in extra_metadata.items() if k != "dynamic_topic"}
+            metadata.update(clean_extra)
+
+        return StageTwoResult(
+            conversation_id      = conversation_id,
+            track_type           = track_type,
+            dialogue_turns       = labeled_turns,
+            speaker_roles        = role_results,
+            interaction_features = ifeats,
+            stage_two_done       = True,
+            metadata             = metadata,
+        )
+
+    async def process_conversation_async(
+        self,
+        conversation_id: str,
+        records:         list[ASRRecord],
+        extra_metadata:  dict[str, Any] | None = None,
+        pre_merged_turns: list[DialogueTurn] | None = None,
+    ) -> StageTwoResult:
+        """
+        异步版全链路处理。
+
+        与 process_conversation 逻辑完全一致，但：
+          - NLP 后端走异步 HTTP（analyze_batch_async）
+          - BGE 编码走异步（IntentRadar 异步接口）
+          - 无需 ThreadPoolExecutor 包装
+
+        Parameters
+        ----------
+        同 process_conversation
+        """
+        from typing import Any as _Any
+
+        # ── 软语义轨道 ────────────────────────────────────────
+        if pre_merged_turns is not None:
+            merged_turns = pre_merged_turns
+        else:
+            merged_turns = self._topology.merge_turns(records)
+        track_type    = self._topology.classify_track(merged_turns)
+        labeled_turns, role_results, ifeats = self._binder.bind(
+            turns=merged_turns, track_type=track_type
+        )
+
+        # ── 硬句法轨道（异步批量） ────────────────────────────
+        full_text: str = " ".join(t.merged_text for t in labeled_turns if not t.is_backchannel and t.merged_text.strip())
+
+        texts_to_analyze: list[str] = []
+        speaker_ids: list[str] = []
+
+        texts_to_analyze.append(full_text)
+        for role_res in role_results:
+            sid = role_res.speaker_id
+            speaker_text = " ".join(t.merged_text for t in labeled_turns if t.speaker_id == sid and not t.is_backchannel and t.merged_text.strip())
+            texts_to_analyze.append(speaker_text)
+            speaker_ids.append(sid)
+
+        # 异步批量提取！
+        batch_feats = await self._syntax.extract_batch_async(texts_to_analyze)
+
+        global_nlp_feats: NlpFeatures = batch_feats[0] if full_text.strip() else NlpFeatures(nlp_backend=self._syntax._backend.name)
+        speaker_nlp_feats: dict[str, dict[str, Any]] = {}
+        for idx, sid in enumerate(speaker_ids):
+            speaker_text = texts_to_analyze[idx + 1]
+            speaker_nlp_feats[sid] = batch_feats[idx + 1].to_dict() if speaker_text.strip() else NlpFeatures(nlp_backend=self._syntax._backend.name).to_dict()
+
+        # ── 动态搜索轨道（异步） ──
+        dynamic_search_result = None
+
+        raw_topic = extra_metadata.get("dynamic_topic") if extra_metadata else None
+
+        topics_to_search = []
+        if isinstance(raw_topic, str) and raw_topic.strip():
+            topics_to_search = [raw_topic.strip()]
+        elif isinstance(raw_topic, list):
+            topics_to_search = [str(t).strip() for t in raw_topic if str(t).strip()]
+
+        if topics_to_search:
+            valid_turns = [
+                t for t in labeled_turns
+                if not t.is_backchannel and len(t.merged_text.strip()) > 1
+            ]
+
+            if valid_turns:
+                window_size = 5
+                stride = 2
+                search_chunks = []
+
+                for i in range(0, len(valid_turns), stride):
+                    window = valid_turns[i : i + window_size]
+                    if not window:
+                        break
+                    chunk_text = " ".join([f"[{t.speaker_id}] {t.merged_text.strip()}" for t in window])
+                    search_chunks.append(chunk_text)
+
+                # 异步批量检索！
+                dynamic_search_result = await self._radar.dynamic_search_batch_async(
+                    search_chunks=search_chunks,
+                    dynamic_topics=topics_to_search,
+                    default_threshold=0.40,
+                    top_k=1,
+                )
+            else:
+                dynamic_search_result = {
+                    "topic_queried": str(topics_to_search),
+                    "matched": False,
+                    "max_score": 0.0,
+                    "top_matches": [],
+                    "status": "skipped_due_to_pure_backchannel"
+                }
+
+        # ── 汇总元信息 ──
+        metadata: dict[str, Any] = {
+            "raw_record_count":  len(records),
+            "merged_turn_count": len(labeled_turns),
+            "track_type":        track_type.value,
+            "nlp_features":      global_nlp_feats.to_dict(),
+            "speaker_nlp_features": speaker_nlp_feats,
+        }
+
+        if dynamic_search_result:
+            metadata["dynamic_search"] = dynamic_search_result
+
+        if extra_metadata:
             clean_extra = {k: v for k, v in extra_metadata.items() if k != "dynamic_topic"}
             metadata.update(clean_extra)
 

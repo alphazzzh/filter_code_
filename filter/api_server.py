@@ -71,7 +71,6 @@ class EngineState:
     
     # 并发控制器
     cpu_pool: ThreadPoolExecutor
-    gpu_semaphore: asyncio.Semaphore
     
     # 👇 过载保护计数器（配合 asyncio.Lock 保证原子性）
     active_requests: int = 0
@@ -81,7 +80,6 @@ state = EngineState()
 
 # 【配置项】生产环境建议抽取到环境变量
 CPU_WORKERS = 16               # CPU 密集型任务的线程池大小 (建议设置为 CPU 核心数)
-MAX_CONCURRENT_GPU = 8        # 允许同时进入 Stage2 (GPU BGE-M3) 的最大并发数，保护显存防 OOM
 STAGE2_TIMEOUT_SECONDS = 30.0 # Stage2 处理的 SLA 超时时间
 
 # 👇 系统最大容忍并发水位线
@@ -98,8 +96,6 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 正在预热企业级 ML 引擎与线程池...")
     state.cpu_pool = ThreadPoolExecutor(max_workers=CPU_WORKERS)
     
-    # 严格限制进入 Stage2 推理的并发数，保护显存
-    state.gpu_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GPU)
     # 过载保护计数器的异步锁（必须在 event loop 内创建）
     state._request_lock = asyncio.Lock()
 
@@ -110,11 +106,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"模型路径配置: BGE={bge_path}, BGE-TEI={bge_svc_url or '(未配置)'}, LTP-HTTP={ltp_url}")
 
     # 实例化所有引擎（LTP/BGE 已抽离为独立微服务，主进程不再加载大模型）
+    # 使用异步模式 StageTwoPipeline
     state.stage1 = StageOneFilter()
     state.stage2 = StageTwoPipeline(
         bge_model_name  = bge_path,
         bge_service_url = bge_svc_url or None,
         ltp_service_url = ltp_url,
+        _async          = True,
     )
     state.scorer = IntelligenceScorer()
     state.bot_engine = BotConfidenceEngine()
@@ -186,7 +184,7 @@ class StandardResponse(BaseModel):
 @app.get("/api/v1/health")
 async def health_check():
     """探针接口：因为 ML 任务被卸载到了线程池，此接口永远能瞬间响应 200"""
-    return {"status": "ok", "gpu_queue": state.gpu_semaphore._value}
+    return {"status": "ok"}
 
 @app.post("/api/analyze", response_model=StandardResponse)
 async def analyze_conversation(req: AnalyzeRequest, response: Response, debug: bool = False):
@@ -274,28 +272,24 @@ async def analyze_conversation(req: AnalyzeRequest, response: Response, debug: b
         else:
             nlp_features_extra["detected_language"] = "unavailable"
 
-        # ── Step 3: 阶段二 (GPU 计算密集，使用 Semaphore 排队 + 超时熔断) ──
+        # ── Step 3: 阶段二 (异步全链路推理，无需线程池包装) ──
         # 将 nlp_features_extra 注入 extra_metadata，随 stage2 结果流到 scorer
         extra_meta = {"dynamic_topic": req.dynamic_topic} if req.dynamic_topic else {}
         nlp_features_extra["filler_word_rate"] = topo_metrics.filler_word_rate
         nlp_features_extra["is_decoupled"] = topo_metrics.is_decoupled
         extra_meta["nlp_features_extra"] = nlp_features_extra
-        stage2_func = partial(
-            state.stage2.process_conversation,
-            conversation_id=req.session_id,
-            records=valid_records,
-            extra_metadata=extra_meta,
-            pre_merged_turns=turns,  # 透传已合并的 turns，避免 CPU 重复 merge_turns
-        )
 
         try:
-            # 申请 GPU 锁，控制最大并发量
-            async with state.gpu_semaphore:
-                # 给大模型推理加上 SLA 超时熔断机制
-                stage2_result = await asyncio.wait_for(
-                    loop.run_in_executor(state.cpu_pool, stage2_func),
-                    timeout=STAGE2_TIMEOUT_SECONDS
-                )
+            # 🔥 核心改造：直接 await 异步方法，不再 run_in_executor
+            stage2_result = await asyncio.wait_for(
+                state.stage2.process_conversation_async(
+                    conversation_id=req.session_id,
+                    records=valid_records,
+                    extra_metadata=extra_meta,
+                    pre_merged_turns=turns,
+                ),
+                timeout=STAGE2_TIMEOUT_SECONDS,
+            )
         except asyncio.TimeoutError:
             # 【企业级特性】超时触发平滑降级，返回 206
             logger.warning(f"[{req.session_id}] Stage2 推理超时 ({STAGE2_TIMEOUT_SECONDS}s)，触发降级。")

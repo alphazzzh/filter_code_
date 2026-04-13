@@ -45,10 +45,10 @@ except ImportError:
     BGEM3FlagModel = None  # type: ignore
 
 try:
-    import requests
-    _REQUESTS_AVAILABLE = True
+    import httpx
+    _HTTPX_AVAILABLE = True
 except ImportError:
-    _REQUESTS_AVAILABLE = False
+    _HTTPX_AVAILABLE = False
 
 import logging
 logger = logging.getLogger(__name__)
@@ -130,6 +130,9 @@ class BgeHttpClient:
         POST /embed  {"inputs": [...], "normalize": true, "truncate": true}
     TEI /embed 响应格式：
         [[0.01, -0.02, ...], [0.03, 0.04, ...]]  (float[][])
+
+    V5.4: 迁移 requests → httpx.Client，与 LtpHttpClient 统一 HTTP 库，
+          减少依赖项，同时为未来全链路异步化（httpx.AsyncClient）做准备。
     """
 
     def __init__(
@@ -139,12 +142,15 @@ class BgeHttpClient:
         max_retries: int = 3,
     ) -> None:
         self._service_url = service_url.rstrip("/")
-        self._timeout = timeout
         self._max_retries = max_retries
-        # 使用 Session 复用 TCP 连接（Keep-Alive），避免高并发下
-        # 短连接导致 TIME_WAIT 端口耗尽
-        self._session = requests.Session()
-        self._session.headers.update({"Content-Type": "application/json"})
+        self._degraded = False  # 降级标记：TEI 服务不可用时置 True
+        # httpx.Client 内置连接池复用（HTTP/1.1 Keep-Alive + HTTP/2 多路复用），
+        # 替代 requests.Session，减少依赖项
+        self._client = httpx.Client(
+            base_url=self._service_url,
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            headers={"Content-Type": "application/json"},
+        )
 
     def encode(
         self,
@@ -174,7 +180,7 @@ class BgeHttpClient:
         }
 
     def _encode_batch(self, texts: list[str]) -> np.ndarray:
-        """单批编码，带重试。"""
+        """单批编码，带重试。重试耗尽后返回零向量（降级），不阻断流水线。"""
         import time
 
         payload = {
@@ -186,18 +192,21 @@ class BgeHttpClient:
         last_error: Exception | None = None
         for attempt in range(self._max_retries):
             try:
-                resp = self._session.post(
-                    f"{self._service_url}/embed",
-                    json=payload,
-                    timeout=self._timeout,
-                )
+                resp = self._client.post("/embed", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
                 # TEI 返回 float[][]，直接转为 numpy
                 return np.array(data, dtype=np.float32)
 
-            except Exception as e:
+            except httpx.HTTPStatusError as e:
                 last_error = e
+                # 4xx 不重试，但也不抛异常，直接降级
+                if 400 <= e.response.status_code < 500:
+                    logger.error(
+                        f"[BgeHttpClient] /embed 请求被拒 "
+                        f"(status={e.response.status_code}): {e.response.text[:200]}"
+                    )
+                    break
                 logger.warning(
                     f"[BgeHttpClient] /embed 请求失败 "
                     f"(尝试 {attempt + 1}/{self._max_retries}): {e}"
@@ -205,21 +214,173 @@ class BgeHttpClient:
                 if attempt < self._max_retries - 1:
                     time.sleep(0.5 * (attempt + 1))  # 指数退避
 
-        raise RuntimeError(
-            f"[BgeHttpClient] /embed 请求在 {self._max_retries} 次重试后仍失败: "
-            f"{last_error}"
+            except (httpx.ConnectError, httpx.TimeoutException) as e:
+                last_error = e
+                logger.warning(
+                    f"[BgeHttpClient] /embed 连接失败 "
+                    f"(尝试 {attempt + 1}/{self._max_retries}): {e}"
+                )
+                if attempt < self._max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+
+            except Exception as e:
+                last_error = e
+                logger.error(f"[BgeHttpClient] /embed 未知异常: {e}")
+                break
+
+        # ── 降级：返回零向量，不阻断流水线 ──
+        # 调用方通过相似度阈值（≥0.65）自然过滤零向量，不会产生误命中
+        self._degraded = True
+        logger.warning(
+            f"[BgeHttpClient] /embed 降级：重试耗尽后返回零向量 "
+            f"(batch_size={len(texts)}, last_error={last_error})"
         )
+        # 使用 1024 维（BGE-M3 dense 输出维度），零向量经 normalize 后范数为 0，
+        # 与任何锚点的余弦相似度均为 0，不会误触发任何意图
+        return np.zeros((len(texts), 1024), dtype=np.float32)
 
     def health(self) -> bool:
         """检查 TEI 服务健康状态。"""
         try:
-            resp = self._session.get(
-                f"{self._service_url}/health",
-                timeout=5.0,
-            )
+            resp = self._client.get("/health", timeout=5.0)
             return resp.status_code == 200
         except Exception:
             return False
+
+    def close(self) -> None:
+        """关闭同步客户端连接池。"""
+        self._client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEI 异步 HTTP 客户端（全链路异步化核心）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class AsyncBgeHttpClient:
+    """
+    调用 HuggingFace TEI /embed 端点的异步客户端。
+
+    使用 httpx.AsyncClient，单线程即可处理数千并发请求，
+    彻底消除 ThreadPoolExecutor + 同步 HTTP 的上下文切换开销。
+
+    接口契约与 BgeHttpClient 一致，所有方法均为 async。
+    """
+
+    def __init__(
+        self,
+        service_url: str = "http://localhost:8080",
+        timeout: float = 30.0,
+        max_retries: int = 3,
+    ) -> None:
+        self._service_url = service_url.rstrip("/")
+        self._max_retries = max_retries
+        self._degraded = False
+        self._client = httpx.AsyncClient(
+            base_url=self._service_url,
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            headers={"Content-Type": "application/json"},
+        )
+
+    async def encode(
+        self,
+        texts: list[str],
+        batch_size: int = 32,
+        max_length: int = 512,
+        **kwargs,
+    ) -> dict[str, np.ndarray]:
+        """异步批量编码，分批发送请求。"""
+        if not texts:
+            return {"dense_vecs": np.array([], dtype=np.float32)}
+
+        all_vecs: list[np.ndarray] = []
+
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
+            vecs = await self._encode_batch(batch)
+            all_vecs.append(vecs)
+
+        return {"dense_vecs": np.vstack(all_vecs)} if all_vecs else {
+            "dense_vecs": np.array([], dtype=np.float32)
+        }
+
+    async def _encode_batch(self, texts: list[str]) -> np.ndarray:
+        """异步单批编码，带重试。重试耗尽后返回零向量（降级），不阻断流水线。"""
+        import asyncio
+
+        payload = {
+            "inputs": texts,
+            "normalize": True,
+            "truncate": True,
+        }
+
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries):
+            try:
+                resp = await self._client.post("/embed", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                return np.array(data, dtype=np.float32)
+
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                if 400 <= e.response.status_code < 500:
+                    logger.error(
+                        f"[AsyncBgeHttpClient] /embed 请求被拒 "
+                        f"(status={e.response.status_code}): {e.response.text[:200]}"
+                    )
+                    break
+                logger.warning(
+                    f"[AsyncBgeHttpClient] /embed 请求失败 "
+                    f"(尝试 {attempt + 1}/{self._max_retries}): {e}"
+                )
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+            except (httpx.ConnectError, httpx.TimeoutException) as e:
+                last_error = e
+                logger.warning(
+                    f"[AsyncBgeHttpClient] /embed 连接失败 "
+                    f"(尝试 {attempt + 1}/{self._max_retries}): {e}"
+                )
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+            except Exception as e:
+                last_error = e
+                logger.error(f"[AsyncBgeHttpClient] /embed 未知异常: {e}")
+                break
+
+        # ── 降级：返回零向量，不阻断流水线 ──
+        self._degraded = True
+        logger.warning(
+            f"[AsyncBgeHttpClient] /embed 降级：重试耗尽后返回零向量 "
+            f"(batch_size={len(texts)}, last_error={last_error})"
+        )
+        return np.zeros((len(texts), 1024), dtype=np.float32)
+
+    async def health(self) -> bool:
+        """异步健康检查。"""
+        try:
+            resp = await self._client.get("/health", timeout=5.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def close(self) -> None:
+        """关闭异步客户端连接池。"""
+        await self._client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        await self.close()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -271,6 +432,17 @@ class IntentRadar:
     - 新增 bge_service_url 参数，优先调用 TEI 服务
     - 环境变量 BGE_SERVICE_URL 优先于参数
 
+    V5.4 变更
+    ─────────────────────────────────────────────────────────
+    - BgeHttpClient 迁移 requests → httpx.Client
+    - 熔断降级：微服务失败返回零向量/降级到 RuleBasedFallback
+
+    V5.5 变更
+    ─────────────────────────────────────────────────────────
+    - 新增 AsyncBgeHttpClient + 异步工厂 get_async_instance()
+    - 新增 async detect_batch / dynamic_search_batch / score_batch
+    - 同步方法完全保留，向后兼容
+
     扩展方法
     ─────────────────────────────────────────────────────────
     在 config_topics.TOPIC_REGISTRY 中追加新主题 → 自动生效，
@@ -278,7 +450,9 @@ class IntentRadar:
     """
 
     _instance: ClassVar[Optional["IntentRadar"]] = None
+    _async_instance: ClassVar[Optional["IntentRadar"]] = None
     _lock:     ClassVar[threading.Lock]          = threading.Lock()
+    _async_lock: ClassVar[threading.Lock]        = threading.Lock()
     _reload_lock: ClassVar[threading.Lock]       = threading.Lock()
 
     def __init__(
@@ -288,9 +462,12 @@ class IntentRadar:
         batch_size:      int   = 32,
         registry:        dict[str, TopicDefinition] = TOPIC_REGISTRY,
         bge_service_url: str | None = None,
+        *,
+        _async: bool = False,
     ) -> None:
         self._batch_size = batch_size
         self._registry   = registry  # 保存注册表引用，供 reload() 使用
+        self._is_async   = _async    # 标记是否使用异步编码器
 
         # ── 环境变量覆盖 ───────────────────────────────────────
         _bge_service_url = os.getenv("BGE_SERVICE_URL", bge_service_url or "")
@@ -301,19 +478,27 @@ class IntentRadar:
         # Level 3: _FallbackEncoder（无 GPU / CI 测试环境兜底）
         self._encoder_name: str = "fallback"
 
-        if _bge_service_url and _REQUESTS_AVAILABLE:
+        if _bge_service_url and _HTTPX_AVAILABLE:
             try:
-                client = BgeHttpClient(service_url=_bge_service_url)
-                if client.health():
+                if _async:
+                    client = AsyncBgeHttpClient(service_url=_bge_service_url)
+                    # 异步实例不做健康检查（需要 event loop，__init__ 可能在同步上下文）
                     self._model = client
                     self._is_fallback = False
-                    self._encoder_name = "tei_http"
-                    logger.info(f"[IntentRadar] 使用 TEI HTTP 服务: {_bge_service_url}")
+                    self._encoder_name = "tei_async_http"
+                    logger.info(f"[IntentRadar] 使用 TEI 异步 HTTP 服务: {_bge_service_url}")
                 else:
-                    logger.warning(
-                        f"[IntentRadar] TEI 服务健康检查失败: {_bge_service_url}，"
-                        f"降级到进程内模型"
-                    )
+                    client = BgeHttpClient(service_url=_bge_service_url)
+                    if client.health():
+                        self._model = client
+                        self._is_fallback = False
+                        self._encoder_name = "tei_http"
+                        logger.info(f"[IntentRadar] 使用 TEI HTTP 服务: {_bge_service_url}")
+                    else:
+                        logger.warning(
+                            f"[IntentRadar] TEI 服务健康检查失败: {_bge_service_url}，"
+                            f"降级到进程内模型"
+                        )
             except Exception as e:
                 logger.warning(
                     f"[IntentRadar] TEI 客户端初始化异常: {e}，"
@@ -347,7 +532,12 @@ class IntentRadar:
 
         # 离线向量化：按顺序拼接所有主题的锚点
         self._anchor_matrices: dict[str, np.ndarray] = {}
-        self._vectorize_from_registry(registry)
+        if self._is_async and self._encoder_name == "tei_async_http":
+            # 异步实例：锚点向量化需要 event loop，延迟到首次调用时执行
+            self._anchor_vectors_initialized = False
+        else:
+            self._vectorize_from_registry(registry)
+            self._anchor_vectors_initialized = True
 
     # ── 单例工厂 ──────────────────────────────────────────────
 
@@ -358,7 +548,7 @@ class IntentRadar:
         use_fp16:        bool = True,
         bge_service_url: str | None = None,
     ) -> "IntentRadar":
-        """双重检查锁定，线程安全单例。"""
+        """双重检查锁定，线程安全单例（同步模式）。"""
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -368,6 +558,25 @@ class IntentRadar:
                         bge_service_url = bge_service_url,
                     )
         return cls._instance
+
+    @classmethod
+    def get_async_instance(
+        cls,
+        model_name:      str  = "BAAI/bge-m3",
+        use_fp16:        bool = True,
+        bge_service_url: str | None = None,
+    ) -> "IntentRadar":
+        """双重检查锁定，线程安全单例（异步模式，使用 AsyncBgeHttpClient）。"""
+        if cls._async_instance is None:
+            with cls._async_lock:
+                if cls._async_instance is None:
+                    cls._async_instance = cls(
+                        model_name      = model_name,
+                        use_fp16        = use_fp16,
+                        bge_service_url = bge_service_url,
+                        _async          = True,
+                    )
+        return cls._async_instance
 
     # ── 热更新 ──────────────────────────────────────────────
 
@@ -417,6 +626,33 @@ class IntentRadar:
             return
 
         encoded = self._model.encode(
+            all_sentences,
+            batch_size=min(self._batch_size, len(all_sentences)),
+            max_length=512,
+        )
+        all_vecs: np.ndarray = encoded["dense_vecs"]
+
+        for topic_id, (start, end) in slice_map.items():
+            self._anchor_matrices[topic_id] = all_vecs[start:end]
+
+    async def _vectorize_from_registry_async(
+        self, registry: dict[str, TopicDefinition]
+    ) -> None:
+        """异步版锚点向量化，在首次异步调用时执行。"""
+        all_sentences: list[str] = []
+        slice_map: dict[str, tuple[int, int]] = {}
+
+        for topic_id, topic_def in registry.items():
+            if not topic_def.bge_anchors:
+                continue
+            start = len(all_sentences)
+            all_sentences.extend(topic_def.bge_anchors)
+            slice_map[topic_id] = (start, len(all_sentences))
+
+        if not all_sentences:
+            return
+
+        encoded = await self._model.encode(
             all_sentences,
             batch_size=min(self._batch_size, len(all_sentences)),
             max_length=512,
@@ -516,6 +752,155 @@ class IntentRadar:
                 all_scores[text_idx][topic_id] = round(max_sim, 4)
 
         return all_scores
+
+    # ── 异步推理接口 ──────────────────────────────────────────
+
+    async def detect_batch_async(self, texts: list[str]) -> list[list[str]]:
+        """异步批量意图检测。仅当 _is_async=True 时可用。"""
+        if not texts:
+            return []
+        raw_scores = await self._compute_raw_scores_async(texts)
+        results: list[list[str]] = []
+        for score_dict in raw_scores:
+            triggered: list[str] = [
+                topic_id
+                for topic_id, score in score_dict.items()
+                if score >= self._threshold_map.get(topic_id, 0.72)
+            ]
+            results.append(triggered)
+        return results
+
+    async def score_batch_async(self, texts: list[str]) -> list[dict[str, float]]:
+        """异步批量评分。仅当 _is_async=True 时可用。"""
+        return await self._compute_raw_scores_async(texts) if texts else []
+
+    async def _compute_raw_scores_async(
+        self, texts: list[str]
+    ) -> list[dict[str, float]]:
+        """异步版语义滑窗 + Max 聚合相似度计算。"""
+        if not texts:
+            return [{} for _ in texts]
+
+        # 延迟初始化锚点向量
+        if not self._anchor_vectors_initialized:
+            await self._vectorize_from_registry_async(self._registry)
+            self._anchor_vectors_initialized = True
+
+        if not self._anchor_matrices:
+            return [{} for _ in texts]
+
+        # Step 1: 滑窗切片
+        all_chunks: list[str] = []
+        chunk_map: list[tuple[int, int]] = []
+        for text in texts:
+            chunks = _semantic_chunking(text)
+            start = len(all_chunks)
+            all_chunks.extend(chunks)
+            chunk_map.append((start, len(all_chunks)))
+
+        if not all_chunks:
+            return [{} for _ in texts]
+
+        # Step 2: 异步批量编码
+        encoded = await self._model.encode(
+            all_chunks,
+            batch_size=min(self._batch_size, len(all_chunks)),
+            max_length=512,
+        )
+        query_vecs: np.ndarray = encoded["dense_vecs"]
+
+        # Step 3: CPU 相似度计算（与同步版相同）
+        all_scores: list[dict[str, float]] = [{} for _ in texts]
+        for topic_id, anchor_mat in self._anchor_matrices.items():
+            sim_mat = cosine_similarity(query_vecs, anchor_mat)
+            for text_idx, (start, end) in enumerate(chunk_map):
+                if start >= end:
+                    continue
+                chunk_sims = sim_mat[start:end]
+                max_sim = float(chunk_sims.max())
+                all_scores[text_idx][topic_id] = round(max_sim, 4)
+
+        return all_scores
+
+    async def dynamic_search_batch_async(
+        self,
+        search_chunks: list[str],
+        dynamic_topics: list[str],
+        default_threshold: float = 0.65,
+        top_k: int = 10,
+    ) -> dict[str, Any]:
+        """异步版多主题批量语义检索。"""
+        clean_topics = [t.strip() for t in dynamic_topics if t and t.strip()]
+        if not search_chunks or not clean_topics:
+            return {
+                "topic_queried": str(clean_topics) if clean_topics else "",
+                "matched": False, "max_score": 0.0,
+                "top_matches": [], "status": "skipped_due_to_empty_input"
+            }
+
+        try:
+            # 1. 异步编码文档块
+            encoded_docs = await self._model.encode(search_chunks)
+            doc_vecs = encoded_docs['dense_vecs'] if isinstance(encoded_docs, dict) and 'dense_vecs' in encoded_docs else encoded_docs
+            if doc_vecs.ndim == 1:
+                doc_vecs = doc_vecs.reshape(1, -1)
+
+            # 2. 异步编码主题指令
+            query_instructions = [
+                f"为这个句子生成表示以用于检索相关文章：{t}"
+                for t in clean_topics
+            ]
+            query_vecs = (await self._model.encode(query_instructions))["dense_vecs"]
+
+            # 3. 矩阵乘法（CPU）
+            similarity_matrix = np.dot(doc_vecs, query_vecs.T)
+
+            # 4. 逐主题提取最佳匹配
+            best_result: dict[str, Any] | None = None
+            for col_idx, topic in enumerate(clean_topics):
+                similarities = similarity_matrix[:, col_idx]
+                valid_indices = np.where(similarities >= default_threshold)[0]
+                top_matches = []
+                if len(valid_indices) > 0:
+                    sorted_indices = valid_indices[np.argsort(similarities[valid_indices])[::-1]]
+                    for idx in sorted_indices[:top_k]:
+                        top_matches.append({
+                            "score": round(float(similarities[idx]), 4),
+                            "chunk_text": search_chunks[idx]
+                        })
+                max_score = float(np.max(similarities)) if len(similarities) > 0 else 0.0
+                topic_result = {
+                    "topic_queried": topic, "matched": len(top_matches) > 0,
+                    "max_score": round(max_score, 4), "top_matches": top_matches,
+                    "status": "success"
+                }
+                if best_result is None or max_score > best_result.get("max_score", 0.0):
+                    best_result = topic_result
+
+            return best_result  # type: ignore[return-value]
+
+        except Exception as e:
+            logger.error(f"[DynamicSearchBatchAsync] 异步批量检索异常 (topics={clean_topics}): {str(e)}", exc_info=True)
+            return {
+                "topic_queried": str(clean_topics), "matched": False,
+                "max_score": 0.0, "top_matches": [],
+                "status": "error", "error_msg": str(e)
+            }
+
+    async def dynamic_search_async(
+        self,
+        search_chunks: list[str],
+        dynamic_topic: str,
+        default_threshold: float = 0.65,
+        top_k: int = 10
+    ) -> dict[str, Any]:
+        """异步版单主题语义检索（便捷接口）。"""
+        return await self.dynamic_search_batch_async(
+            search_chunks=search_chunks,
+            dynamic_topics=[dynamic_topic],
+            default_threshold=default_threshold,
+            top_k=top_k,
+        )
     
 
     # 新增语义检索 (支持 Top-10 滑动窗口完整召回)

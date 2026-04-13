@@ -39,8 +39,9 @@ class ConversationState(TypedDict):
 # ==========================================
 class FilterNode:
     """
-    V5.1  LangGraph 节点封装。
-    支持环境变量配置、LID 语种识别，带异步安全的本地 JSONL 落盘机制。
+    V5.5 LangGraph 节点封装。
+    全链路异步化：BGE/LTP HTTP 调用走 httpx.AsyncClient，不再需要 ThreadPoolExecutor 包装。
+    保留 cpu_pool 仅用于纯 CPU 计算（stage1 正则、stage3 打分、JSONL 落盘）。
     """
     def __init__(
         self, 
@@ -60,10 +61,12 @@ class FilterNode:
         logger.info(f"模型路径配置: BGE={actual_bge_path}, BGE-TEI={actual_bge_svc_url or '(未配置)'}, LTP-HTTP={actual_ltp_url}")
 
         self.stage1 = StageOneFilter()
+        # 使用异步模式的 StageTwoPipeline
         self.stage2 = StageTwoPipeline(
             bge_model_name  = actual_bge_path,
             bge_service_url = actual_bge_svc_url or None,
             ltp_service_url = actual_ltp_url,
+            _async          = True,
         )
         self.scorer = IntelligenceScorer()
         self.voicemail_engine = AdvancedVoicemailDetector()
@@ -81,8 +84,8 @@ class FilterNode:
         else:
             logger.info("ℹ️ fasttext 未安装，跳过 LID 语种识别")
         
+        # CPU 线程池仅用于纯 CPU 密集任务（stage1 正则、stage3 打分、文件 I/O）
         self.cpu_pool = ThreadPoolExecutor(max_workers=int(os.getenv("NODE_MAX_CONCURRENT", 64)))
-        self.gpu_semaphore = asyncio.Semaphore(int(os.getenv("NODE_MAX_CONCURRENT", 64)))
         
         # 确保日志目录存在
         os.makedirs(self.log_dir, exist_ok=True)
@@ -107,11 +110,11 @@ class FilterNode:
             if not records:
                 return {"error": "Parse failed", "final_score": 50}
 
-            # ── 2. 阶段一：极速硬正则过滤 ──
+            # ── 2. 阶段一：极速硬正则过滤（CPU 密集，线程池）──
             s1_func = partial(self.stage1.process_batch, records)
             s1_records = await loop.run_in_executor(self.cpu_pool, s1_func)
 
-            # ── 3. 拓扑引擎分析与 LID 识别 ──
+            # ── 3. 拓扑引擎分析与 LID 识别（CPU，线程池）──
             topo_analyzer = TopologyAnalyzer()
             turns = topo_analyzer.merge_turns(s1_records)
             topo_metrics = self.topo_engine.compute_metrics(turns)
@@ -135,7 +138,7 @@ class FilterNode:
             else:
                 nlp_features_extra["detected_language"] = "unavailable"
 
-            # ── 4. 阶段二：推理 (受限并发) ──
+            # ── 4. 阶段二：异步全链路推理（不再需要 run_in_executor！）──
             extra_meta = {"nlp_features_extra": nlp_features_extra}
             nlp_features_extra["filler_word_rate"] = topo_metrics.filler_word_rate
             nlp_features_extra["is_decoupled"] = topo_metrics.is_decoupled
@@ -143,23 +146,19 @@ class FilterNode:
             if dynamic_topic:
                 extra_meta["dynamic_topic"] = dynamic_topic
 
-            s2_func = partial(
-                self.stage2.process_conversation,
-                conversation_id=session_id,
-                records=s1_records,
-                extra_metadata=extra_meta,
-                pre_merged_turns=turns,  # 透传已合并的 turns，避免 CPU 重复 merge_turns
+            # 🔥 核心改造：直接 await 异步方法，无需线程池包装
+            stage2_result = await asyncio.wait_for(
+                self.stage2.process_conversation_async(
+                    conversation_id=session_id,
+                    records=s1_records,
+                    extra_metadata=extra_meta,
+                    pre_merged_turns=turns,
+                ),
+                timeout=30.0,
             )
-            
-            async with self.gpu_semaphore:
-                stage2_result = await asyncio.wait_for(
-                    loop.run_in_executor(self.cpu_pool, s2_func),
-                    timeout=30.0 
-                )
 
-            # ── 5. 阶段三：打分与落盘 (在 CPU 线程池中执行 I/O) ──
+            # ── 5. 阶段三：打分与落盘（纯 CPU，线程池）──
             def _run_scoring_and_log():
-                # 注入 LID 结果到元数据供打分器消费
                 if nlp_features_extra:
                     stage2_result.metadata["nlp_features_extra"] = nlp_features_extra
 
@@ -169,7 +168,6 @@ class FilterNode:
                     is_decoupled=topo_metrics.is_decoupled
                 )
                 
-                # 组装全量情报字典（包含找回的 language_detection）
                 audit_record = {
                     "timestamp": datetime.now().isoformat(),
                     "session_id": session_id,
