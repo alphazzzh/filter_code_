@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import threading
 from typing import ClassVar, Optional, Any
 
@@ -279,13 +280,38 @@ class AsyncBgeHttpClient:
         max_retries: int = 3,
     ) -> None:
         self._service_url = service_url.rstrip("/")
+        self._timeout = timeout
         self._max_retries = max_retries
         self._degraded = False
-        self._client = httpx.AsyncClient(
-            base_url=self._service_url,
-            timeout=httpx.Timeout(timeout, connect=5.0),
-            headers={"Content-Type": "application/json"},
-        )
+        
+        # ❗ 核心修改1：移除 __init__ 中的 self._client 创建
+        # 改用字典，将 client 与它对应的 Event Loop 绑定
+        self._clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """获取当前 Event Loop 绑定的 httpx.AsyncClient（跨循环绝对安全）"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError("必须在异步上下文中获取 AsyncClient")
+
+        # 如果当前循环没有对应的 client，则新建一个
+        if loop not in self._clients:
+            # 顺手清理已经 close 的 loop 残留，防止内存泄漏
+            closed_loops = [l for l in self._clients.keys() if l.is_closed()]
+            for l in closed_loops:
+                # 安全关闭旧的 httpx client（如果在后台还没关透）
+                # 这里不 await 是因为 loop 已经关闭了，直接丢弃引用即可
+                del self._clients[l]
+
+            # 为当前的新循环绑定一个新的 httpx 客户端
+            self._clients[loop] = httpx.AsyncClient(
+                base_url=self._service_url,
+                timeout=httpx.Timeout(self._timeout, connect=5.0),
+                headers={"Content-Type": "application/json"},
+            )
+            
+        return self._clients[loop]
 
     async def encode(
         self,
@@ -312,6 +338,7 @@ class AsyncBgeHttpClient:
     async def _encode_batch(self, texts: list[str]) -> np.ndarray:
         """异步单批编码，带重试。重试耗尽后返回零向量（降级），不阻断流水线。"""
         import asyncio
+        client = self._get_client()
 
         payload = {
             "inputs": texts,
@@ -322,7 +349,7 @@ class AsyncBgeHttpClient:
         last_error: Exception | None = None
         for attempt in range(self._max_retries):
             try:
-                resp = await self._client.post("/embed", json=payload)
+                resp = await client.post("/embed", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
                 return np.array(data, dtype=np.float32)
@@ -367,14 +394,21 @@ class AsyncBgeHttpClient:
     async def health(self) -> bool:
         """异步健康检查。"""
         try:
-            resp = await self._client.get("/health", timeout=5.0)
+            client = self._get_client()
+            resp = await client.get("/health", timeout=5.0)
             return resp.status_code == 200
         except Exception:
             return False
 
     async def close(self) -> None:
-        """关闭异步客户端连接池。"""
-        await self._client.aclose()
+        """关闭所有 Event Loop 绑定的异步客户端连接池。"""
+        for loop, client in list(self._clients.items()):
+            try:
+                if not loop.is_closed():
+                    await client.aclose()
+            except Exception:
+                pass  # loop 已关闭，丢弃引用即可
+        self._clients.clear()
 
     async def __aenter__(self):
         return self

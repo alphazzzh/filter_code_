@@ -16,6 +16,7 @@ LTP 微服务 HTTP 客户端
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -52,13 +53,13 @@ class LtpHttpClient:
         )).rstrip("/")
         self._timeout = timeout
         self._max_retries = max_retries
-        # 同步客户端
+        # 同步客户端（不依赖 Event Loop，保持单例）
         self._client = httpx.Client(
             base_url=self._base_url,
             timeout=httpx.Timeout(timeout, connect=5.0),
         )
-        # 异步客户端（懒初始化，首次调用 async 方法时创建）
-        self._async_client: httpx.AsyncClient | None = None
+        # 异步客户端：按 Event Loop 绑定，跨循环绝对安全
+        self._async_clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
 
     @property
     def name(self) -> str:
@@ -83,14 +84,25 @@ class LtpHttpClient:
 
     # ── 异步方法（V5.5 新增）─────────────────────────────────
 
-    def _ensure_async_client(self) -> httpx.AsyncClient:
-        """懒初始化异步客户端。"""
-        if self._async_client is None:
-            self._async_client = httpx.AsyncClient(
+    def _get_async_client(self) -> httpx.AsyncClient:
+        """获取当前 Event Loop 绑定的 httpx.AsyncClient（跨循环绝对安全）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError("必须在异步上下文中获取 AsyncClient")
+
+        if loop not in self._async_clients:
+            # 顺手清理已关闭 loop 的残留，防止内存泄漏
+            closed_loops = [l for l in self._async_clients if l.is_closed()]
+            for l in closed_loops:
+                del self._async_clients[l]
+
+            self._async_clients[loop] = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=httpx.Timeout(self._timeout, connect=5.0),
             )
-        return self._async_client
+
+        return self._async_clients[loop]
 
     async def analyze_async(self, text: str) -> dict[str, Any]:
         """异步单条文本分析。"""
@@ -106,9 +118,7 @@ class LtpHttpClient:
 
     async def _call_analyze_async(self, texts: list[str]) -> list[dict[str, Any]]:
         """异步调用 /analyze 接口，带重试。"""
-        import asyncio
-
-        client = self._ensure_async_client()
+        client = self._get_async_client()
         last_exc: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
@@ -146,7 +156,7 @@ class LtpHttpClient:
     async def health_async(self) -> dict[str, Any]:
         """异步健康检查。"""
         try:
-            client = self._ensure_async_client()
+            client = self._get_async_client()
             resp = await client.get("/health")
             resp.raise_for_status()
             return resp.json()
@@ -257,10 +267,14 @@ class LtpHttpClient:
         self._client.close()
 
     async def aclose(self) -> None:
-        """关闭异步客户端连接池。"""
-        if self._async_client is not None:
-            await self._async_client.aclose()
-            self._async_client = None
+        """关闭所有 Event Loop 绑定的异步客户端连接池。"""
+        for loop, client in list(self._async_clients.items()):
+            try:
+                if not loop.is_closed():
+                    await client.aclose()
+            except Exception:
+                pass  # loop 已关闭，丢弃引用即可
+        self._async_clients.clear()
 
     def __enter__(self):
         return self

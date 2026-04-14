@@ -381,6 +381,21 @@ class RiskControlNode:
         except Exception as e:
             logger.error(f"[{session_id}] 风控节点处理异常: {e}", exc_info=True)
             return {"final_score": 50, "risk_error": str(e)}
+        
+
+    # 同步接口包装
+    def process_sync(self, state: GlobalSessionState) -> dict:
+        """
+        同步适配器：
+        在当前线程中创建一个新的事件循环，执行异步的 process 方法，并阻塞等待结果。
+        非常适合供同步的 Flask、Django 或传统的阻塞型脚本调用。
+        """
+        try:
+            # asyncio.run 会自动创建 loop，运行协程，完成后销毁 loop
+            return asyncio.run(self.process(state))
+        except Exception as e:
+            logger.error(f"同步适配器执行异常: {e}", exc_info=True)
+            return {"final_score": 50, "risk_error": f"Sync wrapper error: {e}"}
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 防腐层核心：出参剥离 + 旁路日志
