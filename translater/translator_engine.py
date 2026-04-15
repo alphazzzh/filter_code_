@@ -21,11 +21,20 @@ class LLMTranslatorService:
 """
 
     def __init__(self):
-        # 在类初始化时全局创建一次客户端，复用底层连接池
-        self.client = AsyncOpenAI(
-            base_url="http://localhost:8000/v1",  
-            api_key="EMPTY"                       
-        )
+        # ⚠️ 延迟创建客户端：AsyncOpenAI 底层是 httpx.AsyncClient，
+        #    在实例化时会绑定当前 Event Loop。模块导入阶段 Loop 尚未启动，
+        #    直接实例化会触发 "Event loop is closed" 或静默绑定错误 Loop。
+        self._client = None
+
+    @property
+    def client(self):
+        """懒加载获取客户端，确保绑定到运行中的 Event Loop"""
+        if self._client is None:
+            self._client = AsyncOpenAI(
+                base_url="http://localhost:8000/v1",
+                api_key="EMPTY",
+            )
+        return self._client
 
     def build_user_prompt(self, dialogue_turns: List[DialogueTurn]) -> str:
         payload = [{"id": turn.id, "speaker": turn.speaker, "content": turn.content} for turn in dialogue_turns]

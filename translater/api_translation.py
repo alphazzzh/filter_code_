@@ -318,6 +318,11 @@ async def translate_endpoint(raw_request: Request) -> JSONResponse:
                 )
             else:
                 dialogue_turns = req.data.content
+                # ⚠️ 批处理防串号：客户端传来的结构化 ID 可能跨请求重复
+                # （如请求 A 的 id="1" 和请求 B 的 id="1" 合批后字典覆盖）
+                # 必须用 session_id 加盐，保证全局唯一；返回前再剥离
+                for turn in dialogue_turns:
+                    turn.id = f"{req.session_id}___{turn.id}"
 
             # 空对话直接返回
             if not dialogue_turns:
@@ -369,6 +374,11 @@ async def translate_endpoint(raw_request: Request) -> JSONResponse:
             # ========================================================
             # Layer 5: 封装标准成功响应
             # ========================================================
+            # ⚠️ 剥离批处理加盐前缀，恢复客户端原始 ID
+            for item in translated_items:
+                if "___" in item.id:
+                    item.id = item.id.split("___", 1)[-1]
+
             return JSONResponse(status_code=200, content={
                 "session_id": req.session_id,
                 "status": 200,
